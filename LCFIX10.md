@@ -10,7 +10,7 @@
 
 ## Windows x64 下载与首次启动
 
-在 [Releases](https://github.com/136084599/filebrowser/releases) 查看 LC Fix 10 附件。`.exe` 是服务程序，启动后在浏览器使用。首次试用建议建一个空目录，把发布附件的示例配置保存为 `config.yaml`。在该目录打开 PowerShell，运行下面的命令。
+[直接下载 Windows x64 整包](https://github.com/136084599/filebrowser-transfer-fixes/raw/main/downloads/FileBrowser-LC-Fix-10-Windows-x64.zip)，或打开 [下载目录与整包校验值](https://github.com/136084599/filebrowser-transfer-fixes/tree/main/downloads)。整包包含服务 EXE、示例配置、文件校验值和这份说明。解压后在该目录把 `config.example.yaml` 复制为 `config.yaml`。首次启动后在浏览器使用。在该目录打开 PowerShell，运行下面的命令。
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\files | Out-Null
@@ -25,7 +25,7 @@ try {
 
 打开 `http://127.0.0.1:8080/`，以默认管理员用户名 `admin` 和你刚设置的密码登录。示例配置只监听本机，文件目录为 `files`，SQLite 文件为 `filebrowser.sqlite`。首次初始化完成后，从同一目录使用同一配置重新启动。需要视频缩略图或预览时，另行安装 FFmpeg 并将其加入 PATH。
 
-可用 `Get-FileHash .\filebrowser-transfer-fixes-lcfix10-windows-amd64.exe -Algorithm SHA256` 与 Release 校验值比对。这是下游自行构建的版本。
+可用 `Get-FileHash .\filebrowser-transfer-fixes-lcfix10-windows-amd64.exe -Algorithm SHA256` 与整包中的 `SHA256SUMS.txt` 比对。这是下游自行构建的版本。
 
 ## 迁移与回滚
 
@@ -49,4 +49,4 @@ go build -trimpath -buildvcs=false -ldflags '-s -w' -o .\internal\web\embed\file
 go build -trimpath -buildvcs=false -ldflags '-s -w' -o ..\filebrowser-transfer-fixes-lcfix10-windows-amd64.exe .
 ```
 
-本次重编译验证了 Windows x64 下的启动、首页与管理员登录。你的实际网关、磁盘、共享目录、用户权限和大文件链路仍需在自己的部署环境验收。包内不含生产配置、旧数据库或现场测试日志。
+当前下载包由此分支的程序源文件构建。验证覆盖了 Windows x64 下的启动、首页与管理员登录。你的实际网关、磁盘、共享目录、用户权限和大文件链路仍需在自己的部署环境验收。包内不含生产配置、旧数据库或现场测试日志。
