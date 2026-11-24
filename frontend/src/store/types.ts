@@ -97,7 +97,7 @@ export interface SidebarLink {
 export interface Prompt {
   id?: number;
   name?: string;
-  parentId?: number;
+  parentId?: number | null;
   pinned?: boolean;
   confirm?: unknown;
   action?: unknown;

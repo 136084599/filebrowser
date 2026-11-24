@@ -26,3 +26,8 @@ func isBusyOrLocked(err error) bool {
 		return false
 	}
 }
+
+func isCorrupt(err error) bool {
+	var e *sqlite.Error
+	return errors.As(err, &e) && (e.Code()&0xff == sqlite3.SQLITE_CORRUPT || e.Code()&0xff == sqlite3.SQLITE_NOTADB)
+}

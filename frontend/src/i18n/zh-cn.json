@@ -1035,5 +1035,24 @@
     "days": "天{suffix}",
     "months": "月份{suffix}",
     "timeUnit": "时间单位"
+  },
+  "transfer": {
+    "batchDownload": "批量下载（不压缩，保留文件夹）",
+    "helperInstructions": "先下载任务文件，再把它拖到 Windows 下载器上，选择保存位置即可。多个文件夹并发下载，断网后重新打开任务可以继续。",
+    "getHelper": "下载 Windows 下载器",
+    "verifying": "正在校验文件完整性…",
+    "browserDownload": "浏览器直接下载（不压缩）",
+    "browserInstructions": "每个文件单独交给浏览器下载，无需下载器。文件保存到浏览器下载目录，不保留文件夹层级，并发由浏览器管理。如有提示，请允许本站下载多个文件。",
+    "browserRequested": "已向浏览器发起 {count} 个下载请求。进度和失败结果请查看浏览器下载列表。",
+    "browserRetry": "如有任务被拦截或失败，可点击下面的文件链接重新下载。",
+    "downloadMethod": "请选择下载方式。",
+    "uploadRetrying": "等待 {seconds} 秒后自动重试（{count}/{max}）：{reason}",
+    "uploadRetriesExhausted": "自动重试 {count} 次仍未成功，可点击重试继续。原因：{reason}",
+    "uploadCancelAll": "全部取消",
+    "uploadCancelling": "正在取消并清理…",
+    "uploadCancelHelp": "停止未完成的上传，清理对应临时文件和本批新建的空文件夹；已完成文件保留。",
+    "uploadCancelled": "未完成的上传已取消并清理，已完成文件保留。",
+    "uploadCleanupFailed": "上传已停止，临时文件清理未成功。点击重试可重新清理：{reason}",
+    "uploadIdle": "上传连接长时间没有响应。"
   }
 }

@@ -14,6 +14,7 @@ import { syncEventTheme } from "@/utils/theme";
 import { emitStateChanged } from './eventBus';
 import { getters } from "./getters";
 import { state } from "./state";
+import { insertPrompt, isPromptDescendant, withoutPromptTree } from '@/utils/promptStack';
 import type { SourceInfo, SourceInfoUpdate, UserObject } from "./types";
 
 export const mutations = {
@@ -333,12 +334,12 @@ export const mutations = {
       // close topmost prompt
       if (state.prompts.length === 0) return;
       mutations.closeHovers();
-      state.prompts.pop();
+      state.prompts = withoutPromptTree(state.prompts, state.prompts.at(-1)?.id);
     } else {
       // close prompt by ID
       const idx = state.prompts.findIndex(p => p.id === id);
       if (idx === -1) return;
-      state.prompts.splice(idx, 1);
+      state.prompts = withoutPromptTree(state.prompts, id);
     }
     // Pre-existing: no top-level state.stickySidebar (only state.user.stickySidebar), so this
     // is always truthy-negated. Left as-is; see PR description.
@@ -347,12 +348,23 @@ export const mutations = {
     }
     emitStateChanged();
   },
+  dismissPrompt: (id?: number) => {
+    const target = id ?? state.prompts.at(-1)?.id;
+    if (target === undefined) return;
+    const closing = state.prompts.filter(prompt => prompt.id === target || isPromptDescendant(state.prompts, prompt.id, target));
+    for (const prompt of [...closing].reverse()) {
+      if (typeof prompt.cancel === 'function') prompt.cancel();
+    }
+    mutations.closeTopPrompt(target);
+  },
   showPrompt: (value) => {
     state.promptIdCounter += 1;
     const id = state.promptIdCounter;
-    // Set parentId to the current topmost prompt, unless the prompt is pinned.
+    // A child stays above its parent, including when either window is pinned.
+    // Pinned windows remain independent unless an owner is supplied.
+    // Explicit null also starts an independent unpinned window group.
     let parentId = value?.parentId;
-    if (!parentId && !value?.pinned) {
+    if (parentId === undefined && !value?.pinned) {
       const topPrompt = state.prompts[state.prompts.length - 1];
       if (topPrompt) {
         parentId = topPrompt.id;
@@ -379,15 +391,9 @@ export const mutations = {
       discard: value?.discard,
       cancel: value?.cancel,
     };
-    const pinnedCount = state.prompts.filter(p => p.pinned).length;
-    if (entry.pinned) {
-      state.prompts.push(entry);
-    } else {
-      // Non‑pinned prompts go just before the first pinned prompt
-      const insertIndex = state.prompts.length - pinnedCount;
-      state.prompts.splice(insertIndex, 0, entry);
-    }
+    state.prompts = insertPrompt(state.prompts, entry);
     mutations.hideTooltip(true);
+    return id;
   },
   updatePromptTitle: (id, title) => {
     const prompt = state.prompts.find((p) => p.id === id);

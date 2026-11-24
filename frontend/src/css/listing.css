@@ -6,6 +6,11 @@
   padding-bottom: 2.5em; /* Space for status bar - this prevents items from going behind */
 }
 
+.listing-items .listing-item.navigation-returned {
+  outline: 3px solid var(--primaryColor);
+  outline-offset: -3px;
+}
+
 body.rtl .listing-items {
   margin-right: 16em;
 }

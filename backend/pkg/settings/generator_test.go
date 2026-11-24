@@ -32,7 +32,7 @@ func createTestSourceFile(t *testing.T, content string) (string, func()) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	return path, func() {}
+	return filepath.ToSlash(path), func() {}
 }
 
 func TestGenerateConfigYaml_StringQuoting(t *testing.T) {
@@ -315,7 +315,7 @@ func TestGenerateConfigYaml_IntegrationTest(t *testing.T) {
 			showComments:     false,
 			showFull:         true,
 			filterDeprecated: false,
-			expectSecret:     true,  // secrets should be hidden
+			expectSecret:     true, // secrets should be hidden
 			expectDeprecated: false,
 			expectFull:       true,  // all fields shown
 			expectComments:   false, // no comments

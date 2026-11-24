@@ -1,6 +1,22 @@
 <template>
   <div v-if="!hasDownloads && currentPrompt && currentPrompt.confirm" class="card-content">
-    <p>{{ $t("prompts.downloadMessage") }}</p>
+    <p>{{ $t(isShare ? "prompts.downloadMessage" : "transfer.downloadMethod") }}</p>
+    <button v-if="!isShare" type="button" class="button button--block" :disabled="browserTasks.submitting" @click="handleFormatSelect('browser')" v-focus>
+      {{ $t("transfer.browserDownload") }}
+    </button>
+    <p v-if="!isShare">{{ $t("transfer.browserInstructions") }}</p>
+    <div v-if="browserTasks.entries.length" class="browser-tasks" aria-live="polite">
+      <p>{{ $t("transfer.browserRequested", { count: browserTasks.requested }) }}</p>
+      <p>{{ $t("transfer.browserRetry") }}</p>
+      <ul>
+        <li v-for="entry in browserTasks.entries" :key="entry.url"><a :href="entry.url" :download="entry.name">{{ entry.path }}</a></li>
+      </ul>
+    </div>
+    <button v-if="!isShare" type="button" class="button button--block" :disabled="browserTasks.submitting" @click="handleFormatSelect('batch')">
+      {{ $t("transfer.batchDownload") }}
+    </button>
+    <p v-if="!isShare && needsHelper">{{ $t("transfer.helperInstructions") }}</p>
+    <a v-if="!isShare && needsHelper" :href="helperURL" class="button button--block" download="filebrowser-download.exe">{{ $t("transfer.getHelper") }}</a>
 
     <button
       type="button"
@@ -8,8 +24,8 @@
       :key="format"
       class="button button--block"
       :aria-label="`Download as ${format}`"
+      :disabled="browserTasks.submitting"
       @click="handleFormatSelect(format)"
-      v-focus
     >
       {{ ext }}
     </button>
@@ -29,6 +45,7 @@
           <i class="material-symbols file-icon">insert_drive_file</i> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
           <div class="file-info">
             <p class="file-name">{{ download.name }}</p>
+            <p v-if="download.verifyingIntegrity" class="file-name">{{ $t('transfer.verifying') }}</p>
             <progress-bar
               :val="download.status === 'completed'
                 ? $t('prompts.completed')
@@ -89,6 +106,8 @@ import { getters, mutations } from "@/store";
 import { downloadManager } from "@/utils/downloadManager";
 import { resourcesApi } from "@/api";
 import ProgressBar from "@/components/ProgressBar.vue";
+import { downloadBatchEntry, browserDownloadState, clearBrowserDownloads } from "@/utils/batchDownload";
+import { globalVars } from "@/utils/constants";
 
 export default {
   name: "download",
@@ -102,6 +121,10 @@ export default {
     },
   }),
   computed: {
+    browserTasks() { return browserDownloadState; },
+    isShare() { return getters.isShare(); },
+    needsHelper() { return !window.isSecureContext || typeof window.showDirectoryPicker !== "function"; },
+    helperURL() { return `${(globalVars.baseURL || "/").replace(/\/$/, "")}/public/static/filebrowser-download.exe`; },
     currentPrompt() {
       return getters.currentPrompt();
     },
@@ -122,6 +145,7 @@ export default {
   },
   beforeUnmount() {
     downloadManager.reset();
+    clearBrowserDownloads();
   },
   methods: {
     formatDownloadError(download) {
@@ -145,6 +169,7 @@ export default {
       if (!downloadManager) return;
       const download = downloadManager.findById(id);
       if (download) {
+        if (download.batch) { await downloadBatchEntry(download); return; }
         // Re-trigger download by calling the download function again
         downloadManager.remove(id);
         try {
@@ -187,6 +212,13 @@ export default {
 </script>
 
 <style scoped>
+.browser-tasks ul {
+  max-height: 12rem;
+  overflow-y: auto;
+  overflow-wrap: anywhere;
+  padding-left: 1.5rem;
+}
+
 .download-list {
   overflow-y: auto;
   padding-right: 0.5em;

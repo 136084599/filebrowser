@@ -263,6 +263,8 @@ export default {
     routePath() {
       return state.route.path ?? "";
     },
+    previewAccount() { return `${state.user?.id ?? ""}:${state.sessionId ?? ""}`; },
+    previewPreferences() { return JSON.stringify([getters.previewPerms(), state.user?.disablePreviewExt, state.shareInfo?.disableThumbnails]); },
   },
   methods: {
     handle3DError() {
@@ -458,6 +460,21 @@ export default {
     },
   },
   watch: {
+    previewAccount() {
+      this.imageState = "loading";
+      if (this.hasPreviewImage && this.imageTargetSrc) this.loadImage(this.imageTargetSrc);
+    },
+    previewPreferences() {
+      this.cancelActivePreviews();
+      this.imageState = "loading";
+      if (this.hasPreviewImage && this.imageTargetSrc) this.loadImage(this.imageTargetSrc);
+    },
+    hasPreview(value) {
+      if (!value) { this.cancelActivePreviews(); return; }
+      this.imageState = "loading";
+      this.updateImageTargetSrc();
+      if (this.hasPreviewImage && this.imageTargetSrc) this.loadImage(this.imageTargetSrc);
+    },
     routePath() {
       this.cancelActivePreviews();
       this.imageState = "loading";

@@ -4,6 +4,8 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"time"
@@ -19,6 +21,7 @@ var errUploadSessionConflict = errors.New("conflicting upload session")
 
 type uploadSessionEntry struct {
 	id       string
+	actor    string
 	lastSeen time.Time
 }
 
@@ -29,7 +32,20 @@ type uploadSessionRegistry struct {
 
 var activeUploadSessions uploadSessionRegistry
 
-func (r *uploadSessionRegistry) acquire(realPath, sessionID string) error {
+func canonicalUploadPath(path string) string {
+	path = filepath.Clean(path)
+	if runtime.GOOS == "windows" {
+		path = strings.ToLower(path)
+	}
+	return path
+}
+
+func (r *uploadSessionRegistry) acquire(realPath, sessionID string, actors ...string) error {
+	actor := ""
+	if len(actors) > 0 {
+		actor = actors[0]
+	}
+	realPath = canonicalUploadPath(realPath)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.sessions == nil {
@@ -39,24 +55,37 @@ func (r *uploadSessionRegistry) acquire(realPath, sessionID string) error {
 	if active, ok := r.sessions[realPath]; ok {
 		if now.Sub(active.lastSeen) > uploadSessionTTL {
 			delete(r.sessions, realPath)
-		} else if active.id != sessionID {
+		} else if active.id != sessionID || active.actor != actor {
 			return fmt.Errorf("%w for %q", errUploadSessionConflict, realPath)
 		}
 	}
-	r.sessions[realPath] = uploadSessionEntry{id: sessionID, lastSeen: now}
+	r.sessions[realPath] = uploadSessionEntry{id: sessionID, actor: actor, lastSeen: now}
 	return nil
 }
 
-func (r *uploadSessionRegistry) release(realPath, sessionID string) {
+func (r *uploadSessionRegistry) release(realPath, sessionID string, actors ...string) {
+	actor := ""
+	if len(actors) > 0 {
+		actor = actors[0]
+	}
+	realPath = canonicalUploadPath(realPath)
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if active, ok := r.sessions[realPath]; ok && active.id == sessionID {
+	if active, ok := r.sessions[realPath]; ok && active.id == sessionID && active.actor == actor {
 		delete(r.sessions, realPath)
 	}
 }
 
+func (r *uploadSessionRegistry) foreignOwner(realPath, session, actor string) bool {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	entry, ok := r.sessions[canonicalUploadPath(realPath)]
+	return ok && entry.id == session && entry.actor != actor && time.Since(entry.lastSeen) <= uploadSessionTTL
+}
+
 // expireForTest marks a path's session as expired without deleting it (for unit tests).
 func (r *uploadSessionRegistry) expireForTest(realPath string) {
+	realPath = canonicalUploadPath(realPath)
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if active, ok := r.sessions[realPath]; ok {

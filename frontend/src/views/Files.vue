@@ -2,7 +2,7 @@
   <div>
     <div v-if="loadingProgress < 100" class="progress-line" :style="{ width: `${loadingProgress}%`, ...moveWithSidebar }"></div>
     <errors v-if="error" :errorCode="error.status" />
-    <component v-else-if="currentViewLoaded" :is="currentView" :fbdata="req"></component>
+    <component v-else-if="currentViewLoaded" :is="currentView" :fbdata="req" v-on="currentView === 'listingView' ? { 'listing-ready': scrollToHash } : {}"></component>
     <div v-else>
       <h2 class="message delayed">
         <LoadingSpinner size="medium" />
@@ -20,7 +20,8 @@ import Preview from "@/views/files/Preview.vue";
 import ListingView from "@/views/files/ListingView.vue";
 import { state, mutations, getters } from "@/store";
 import router from "@/router";
-import { extractSourceFromPath, removeLastDir, base64Encode, removeTrailingSlash } from "@/utils/url.js";
+import { extractSourceFromPath, removeLastDir, removeTrailingSlash } from "@/utils/url.js";
+import { directoryContext, restoreDirectoryPosition, clearDirectoryHighlight } from "@/utils/directoryNavigation";
 import LoadingSpinner from "@/components/LoadingSpinner.vue";
 import { globalVars } from "@/utils/constants";
 import { syncEventTheme } from "@/utils/theme";
@@ -132,6 +133,7 @@ export default {
       width: window.innerWidth,
       lastPath: "",
       lastHash: "",
+      lastRestoredListing: null,
       popupSource: "",
       loadingProgress: 0,
       loadingStartTime: null,
@@ -189,51 +191,33 @@ export default {
   },
   beforeUnmount() {
     window.removeEventListener("keydown", this.keyEvent);
+    window.removeEventListener("hashchange", this.scrollToHash);
+    clearDirectoryHighlight();
   },
   unmounted() {
     mutations.replaceRequest({}); // Use mutation
   },
   methods: {
-    scrollToHash() {
-      let scrollToId = "";
-      let targetName = "";
-      // scroll to previous item either from location hash or from previousItemHashId state
-      // prefers location hash
-      const noHashChange = window.location.hash === this.lastHash
-      if (noHashChange && state.previousHistoryItem?.name === "") return;
-      this.lastHash = window.location.hash;
-      if (window.location.hash) {
-        const rawHash = window.location.hash.slice(1);
-        let decodedName;
-        try {
-          decodedName = decodeURIComponent(rawHash);
-        } catch (_e) {
-          // If the hash contains malformed escape sequences, fall back to raw
-          decodedName = rawHash;
-        }
-        targetName = decodedName;
-        scrollToId = base64Encode(encodeURIComponent(decodedName));
-      } else if (state.previousHistoryItem?.name &&
-                 state.previousHistoryItem.path === state.req.path &&
-                 state.previousHistoryItem.source === state.req.source) {
-        targetName = state.previousHistoryItem?.name;
-        scrollToId = base64Encode(encodeURIComponent(state.previousHistoryItem?.name));
-      }
-      // Don't call getElementById with empty string
-      if (!scrollToId || scrollToId.trim() === '') {
-        return;
-      }
-      // Re-select the item we are returning to -- replaces the previous glow effect.
-      const targetIndex = state.req?.items?.findIndex((item) => item.name === targetName);
-      if (targetIndex !== -1) {
-        mutations.addSelected(targetIndex);
-      }
-      const element = document.getElementById(scrollToId);
-      if (element) {
-        element.scrollIntoView({
-          behavior: "instant",
-          block: "center",
-        });
+    async scrollToHash() {
+      const request = state.req;
+      const hash = window.location.hash;
+      if (request?.type !== 'directory' || this.error) return;
+      await this.$nextTick();
+      await new Promise(resolve => requestAnimationFrame(resolve));
+      if (request !== state.req || getters.isLoading() ||
+          (this.lastRestoredListing === request && this.lastHash === hash)) return;
+      const root = this.$el.querySelector('.listing-view-root');
+      if (!root) return;
+      const name = restoreDirectoryPosition(
+        directoryContext(request, state.user, getters.isShare() ? state.shareInfo.hash : ''),
+        document.getElementById('main'), root, hash,
+      );
+      this.lastRestoredListing = request;
+      this.lastHash = hash;
+      // Explicit file links retain their selection; returning only marks location.
+      if (hash && name) {
+        const index = request.items?.findIndex(item => item.name === name);
+        if (index >= 0) mutations.addSelected(index);
       }
     },
     async patchMediaMetadataIfNeeded(listing, source) {
@@ -490,9 +474,6 @@ export default {
         }
       }
 
-      setTimeout(() => {
-        this.scrollToHash();
-      }, 25);
       this.lastPath = state.route.path;
     },
 

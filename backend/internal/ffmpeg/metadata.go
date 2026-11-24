@@ -101,7 +101,7 @@ func (s *Service) GetMediaDuration(ctx context.Context, mediaPath string) (float
 	if err != nil {
 		return 0, err
 	}
-	cacheKey := fmt.Sprintf("%s:%d", localPath, fileInfo.ModTime().Unix())
+	cacheKey := fmt.Sprintf("%s:%d:%d", localPath, fileInfo.Size(), fileInfo.ModTime().UnixNano())
 	if duration, found := MetadataCache.Get(cacheKey); found {
 		return duration, nil
 	}

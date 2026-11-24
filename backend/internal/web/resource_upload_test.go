@@ -370,7 +370,7 @@ func TestResourcePostHandler_ChunkedShortChunkContentLength(t *testing.T) {
 	}
 
 	realPath := filepath.Join(root, "short.bin")
-	tempPath := uploadTempPath(realPath, "test-session")
+	tempPath := uploadActorTempPath(realPath, "test-session", "1:")
 	info, err := os.Stat(tempPath)
 	if err != nil {
 		t.Fatalf("expected temp preserved: %v", err)
@@ -427,7 +427,7 @@ func TestResourcePostHandler_ChunkedKeepsPartialOnBodyError(t *testing.T) {
 	}
 
 	realPath := filepath.Join(root, "resume.bin")
-	tempPath := uploadTempPath(realPath, "test-session")
+	tempPath := uploadActorTempPath(realPath, "test-session", "1:")
 	info, err := os.Stat(tempPath)
 	if err != nil {
 		t.Fatalf("expected temp preserved: %v", err)
@@ -578,8 +578,8 @@ func TestResourcePostHandler_PartialChunkResponse(t *testing.T) {
 	if status != http.StatusOK || err != nil {
 		t.Fatalf("chunk1 status=%d err=%v", status, err)
 	}
-	if rec.Header().Get("Connection") != "close" {
-		t.Fatalf("expected Connection: close, got %q", rec.Header().Get("Connection"))
+	if rec.Header().Get("Connection") != "" {
+		t.Fatalf("chunk response must allow connection reuse, got %q", rec.Header().Get("Connection"))
 	}
 	var payload chunkUploadResponse
 	if decodeErr := json.NewDecoder(rec.Body).Decode(&payload); decodeErr != nil {

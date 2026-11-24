@@ -41,6 +41,8 @@ type Service struct {
 	ffmpegService *ffmpeg.FFmpegService // Shared FFmpeg service for video and HEIC/JPEG fallback
 	imageSem      chan struct{}         // Semaphore for small image decode/encode (<8MB)
 	imageLargeSem chan struct{}         // Semaphore for large image decode/encode (>=8MB), nil if only 1 processor
+	videoSem      chan struct{}
+	flights       previewFlights
 }
 
 // Calculate split between small and large imaging library processors
@@ -49,7 +51,7 @@ type Service struct {
 //	1 processor:  single image processor for all sizes
 //	2 processors: 1 large, 1 small
 //	3-6 processors: 2 large, rest small
-//	7+ processors: 3 large, rest small
+//	7+ processors: 4 large/video, rest small
 func NewPreviewGenerator(concurrencyLimit int, cacheDir string) *Service {
 	configureImagingParallelism()
 
@@ -96,7 +98,7 @@ func NewPreviewGenerator(concurrencyLimit int, cacheDir string) *Service {
 	} else {
 		var largeLimit int
 		if concurrencyLimit >= 7 {
-			largeLimit = 3
+			largeLimit = 4
 		} else if concurrencyLimit >= 3 {
 			largeLimit = 2
 		} else {
@@ -114,6 +116,10 @@ func NewPreviewGenerator(concurrencyLimit int, cacheDir string) *Service {
 	// Example: concurrencyLimit=10 → ~500MB max
 	settings.Env.MuPdfAvailable = docEnabled()
 
+	videoSem := imageLargeSem
+	if videoSem == nil {
+		videoSem = imageSem
+	}
 	return &Service{
 		fileCache:     fileCache,
 		cacheDir:      actualCacheDir,
@@ -121,6 +127,7 @@ func NewPreviewGenerator(concurrencyLimit int, cacheDir string) *Service {
 		ffmpegService: ffmpegService,
 		imageSem:      imageSem,
 		imageLargeSem: imageLargeSem,
+		videoSem:      videoSem,
 	}
 }
 
@@ -204,11 +211,20 @@ func GetPreviewForFile(ctx context.Context, file iteminfo.ExtendedFileInfo, prev
 		return nil, fmt.Errorf("failed to load from cache: %w", err)
 	} else if found {
 		if len(data) < minPreviewSize {
-			return nil, ErrPreviewTooSmall
+			// Old versions cached empty failures forever. Treat damaged/empty
+			// entries as misses so a transient failure can recover.
+			_ = service.fileCache.Delete(ctx, cacheKey)
+		} else {
+			return data, nil
 		}
-		return data, nil
 	}
-	return GeneratePreviewWithMD5(ctx, file, previewSize, url, seekPercentage, cacheHash)
+	return service.flights.do(ctx, cacheKey, func(work context.Context) ([]byte, error) {
+		// Another request may have completed between the initial lookup and joining.
+		if data, found, err := service.fileCache.Load(work, cacheKey); err == nil && found && len(data) >= minPreviewSize {
+			return data, nil
+		}
+		return GeneratePreviewWithMD5(work, file, previewSize, url, seekPercentage, cacheHash)
+	})
 }
 
 // filePreviewType represents the type of preview generation needed
@@ -286,7 +302,7 @@ func (s *Service) generateRawPreview(ctx context.Context, file iteminfo.Extended
 		return s.generateImagePreview(ctx, file, previewSize)
 
 	case previewTypeVideo:
-		return s.generateVideoPreviewBytes(ctx, file, seekPercentage)
+		return s.generateVideoPreviewBytes(ctx, file, previewSize, seekPercentage)
 
 	case previewTypeAudio:
 		if file.Metadata != nil && len(file.Metadata.AlbumArt) > 0 {
@@ -331,24 +347,27 @@ func (s *Service) generateHEICPreview(ctx context.Context, file iteminfo.Extende
 }
 
 // generateVideoPreviewBytes generates preview frame from video file
-func (s *Service) generateVideoPreviewBytes(ctx context.Context, file iteminfo.ExtendedFileInfo, seekPercentage int) ([]byte, error) {
+func (s *Service) generateVideoPreviewBytes(ctx context.Context, file iteminfo.ExtendedFileInfo, previewSize string, seekPercentage int) ([]byte, error) {
 	// Check if this video format is enabled for preview generation
 	ext := strings.TrimPrefix(strings.ToLower(filepath.Ext(file.Name)), ".")
 	if !settings.CanConvertVideo(ext) {
 		return nil, fmt.Errorf("video preview generation is disabled for .%s files in settings", ext)
 	}
 
-	videoSeekPercentage := seekPercentage
-	if videoSeekPercentage == 0 {
-		videoSeekPercentage = 10
+	options, err := getPreviewOptions(previewSize)
+	if previewSize == "original" {
+		options.Width, options.Height = 0, 0
+		err = nil
 	}
-
-	imageBytes, err := s.GenerateVideoPreview(ctx, file.RealPath, videoSeekPercentage)
+	if err != nil {
+		return nil, err
+	}
+	imageBytes, err := s.GenerateVideoPreview(ctx, file.RealPath, seekPercentage, options.Width, options.Height)
 	if err != nil {
 		// Don't log client cancellations as errors
 		if ctx.Err() != context.Canceled {
 			logger.Errorf("Video preview generation failed for '%s' (path: %s, seek: %d%%): %v",
-				file.Name, file.RealPath, videoSeekPercentage, err)
+				file.Name, file.RealPath, seekPercentage, err)
 		}
 		return nil, fmt.Errorf("failed to create image for video file: %w", err)
 	}
@@ -438,7 +457,14 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 	// MuPDF document previews render at target size in CGO; they only need docGenMutex.
 	previewTypeEarly := determinePreviewType(file)
 	skipImageSem := previewTypeEarly == previewTypeDocument && settings.Env.MuPdfAvailable
-	if !skipImageSem {
+	if previewTypeEarly == previewTypeVideo {
+		select {
+		case service.videoSem <- struct{}{}:
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+		defer func() { <-service.videoSem }()
+	} else if !skipImageSem {
 		const largeFileSizeThreshold = 8 * 1024 * 1024 // 8MB
 		if file.Size >= largeFileSizeThreshold && service.imageLargeSem != nil {
 			if err := service.acquireImageLargeSem(ctx); err != nil {
@@ -498,7 +524,6 @@ func GeneratePreviewWithMD5(ctx context.Context, file iteminfo.ExtendedFileInfo,
 	if len(imageBytes) < minPreviewSize {
 		logger.Errorf("Generated image too small for '%s' (type: %s): %d bytes - likely an error occurred",
 			file.Name, file.Type, len(imageBytes))
-		_ = service.fileCache.Store(ctx, cacheKey, []byte{})
 		return nil, ErrPreviewTooSmall
 	}
 
@@ -655,6 +680,11 @@ func CacheKey(md5, previewSize string, percentage int) string {
 }
 
 func DelThumbs(ctx context.Context, file iteminfo.ExtendedFileInfo) {
+	// Upload replacement must remain available when previews/cache are disabled
+	// or have not yet been initialized.
+	if service == nil || service.fileCache == nil {
+		return
+	}
 	// Generate metadata-based cache hash for deletion
 	hasher := md5.New()
 	cacheString := fmt.Sprintf("%s:%d:%s", file.RealPath, file.Size, file.ModTime.Format(time.RFC3339Nano))

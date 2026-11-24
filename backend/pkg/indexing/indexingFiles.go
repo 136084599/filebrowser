@@ -407,6 +407,14 @@ func Initialize(source *settings.Source, mock bool, isNewDb bool) {
 			Complexity: 0,
 		},
 	}
+	if !isNewDb {
+		sizes, err := indexDB.LoadFolderSizes(source.Name)
+		if err != nil {
+			logger.Errorf("[%s] could not restore folder sizes: %v", source.Name, err)
+		} else {
+			newIndex.folderSizes = sizes
+		}
+	}
 	indexes[newIndex.Name] = &newIndex
 	indexesMutex.Unlock()
 	if !newIndex.Config.ResolvedRules.IndexingDisabled {
@@ -654,6 +662,8 @@ func (idx *Index) getBasicDirInfo(ctx *PathContext) *iteminfo.FileInfo {
 
 // Define a function to recursively index files and directories
 func (idx *Index) indexDirectory(indexPath string, opts Options, scanner *Scanner) (int64, bool, error) {
+	// Source totals must not depend on the browsing user's hidden-file toggle.
+	opts.ShowHidden = true
 	if !strings.HasSuffix(indexPath, "/") {
 		indexPath = indexPath + "/"
 	}
@@ -847,6 +857,12 @@ func (idx *Index) processDirectoryItem(file os.FileInfo, indexPath string, subdi
 		subdirSize, subdirHasPreview, err := idx.indexDirectory(dirPath, opts, scanner)
 		if err != nil {
 			logger.Errorf("Failed to index directory %s: %v", dirPath, err)
+			if scanner != nil && err != errors.ErrNotIndexed {
+				scanner.failed = true
+			}
+			if old, ok := idx.GetReducedMetadata(dirPath, true); ok && old != nil {
+				return &old.ItemInfo, old.Size, true
+			}
 			return nil, 0, false
 		}
 		// Apply minimum 4KB for directories only in disk usage mode
@@ -944,6 +960,9 @@ func (idx *Index) GetDirInfoCore(dirInfo *os.File, stat os.FileInfo, indexPath s
 
 	for _, file := range files {
 		subfileBaseName := file.Name()
+		if strings.HasPrefix(subfileBaseName, ".fbchunk-") || strings.HasSuffix(subfileBaseName, ".uploading.tmp") {
+			continue
+		}
 		isDir := iteminfo.IsDirectory(file)
 		fullCombined := indexPath + subfileBaseName
 		// Add trailing slash for directories to match normalized folder paths
@@ -1160,11 +1179,19 @@ func (idx *Index) RefreshDirectory(indexPath string, recursive bool) error {
 	}
 
 	_, _, err = idx.indexDirectory(indexPath, opts, nil)
-	return err
+	if err != nil {
+		return err
+	}
+	return idx.SyncFolderSizesToDB()
 }
 
 // updateFolderSizeAndParents updates a folder size and propagates the change to all parents
 func (idx *Index) updateFolderSizeAndParents(path string, newSize uint64, previousSize uint64, updateTarget bool) {
+	idx.folderSizesMu.Lock()
+	defer idx.folderSizesMu.Unlock()
+	if updateTarget {
+		previousSize = idx.folderSizes[path]
+	}
 	// Calculate the delta
 	var sizeDelta int64
 	if newSize >= previousSize {
@@ -1176,9 +1203,6 @@ func (idx *Index) updateFolderSizeAndParents(path string, newSize uint64, previo
 	if sizeDelta == 0 && !updateTarget {
 		return // No change, nothing to propagate
 	}
-
-	idx.folderSizesMu.Lock()
-	defer idx.folderSizesMu.Unlock()
 
 	// Optionally update the target folder itself
 	if updateTarget {
@@ -1303,7 +1327,9 @@ func (idx *Index) SyncFolderSizesToDB() error {
 		// Remove synced paths from unsynced map
 		idx.folderSizesMu.Lock()
 		for _, path := range batchPaths {
-			delete(idx.folderSizesUnsynced, path)
+			if idx.folderSizes[path] == sizesToSync[path] {
+				delete(idx.folderSizesUnsynced, path)
+			}
 		}
 		idx.folderSizesMu.Unlock()
 
@@ -1659,6 +1685,7 @@ func (idx *Index) writePersistedIndexInfo() error {
 	idx.mu.RLock()
 	scanners := make(map[string]*dbindex.PersistedScannerInfo)
 	for path, scanner := range idx.scanners {
+		scanner.statsMu.RLock()
 		scanners[path] = &dbindex.PersistedScannerInfo{
 			Path:            path,
 			Complexity:      scanner.complexity,
@@ -1668,7 +1695,9 @@ func (idx *Index) writePersistedIndexInfo() error {
 			NumDirs:         scanner.numDirs,
 			NumFiles:        scanner.numFiles,
 			LastScanned:     scanner.lastScanned,
+			FullScanCounter: scanner.fullScanCounter,
 		}
+		scanner.statsMu.RUnlock()
 	}
 
 	complexity := idx.getComplexityUnlocked()

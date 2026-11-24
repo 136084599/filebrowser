@@ -10,8 +10,8 @@ import (
 	"time"
 
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/sqlitebusy"
-	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/pkg/indexing/iteminfo"
+	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
@@ -21,11 +21,41 @@ type IndexDB struct {
 	*TempDB
 }
 
+var errIndexRebuild = errors.New("index cache requires rebuild")
+
+func (db *IndexDB) handleIntegrityError(err error) error {
+	if sqlitebusy.IsCorrupt(err) {
+		return db.deleteCorruptedDatabase()
+	}
+	return fmt.Errorf("could not check index cache; existing file preserved: %w", err)
+}
+
+func quarantineIndexFile(path string) error {
+	backup := path + ".corrupt-" + time.Now().Format("20060102-150405.000000000")
+	for _, suffix := range []string{"", "-wal", "-shm", "-journal"} {
+		if _, err := os.Stat(path + suffix); os.IsNotExist(err) {
+			continue
+		} else if err != nil {
+			return err
+		}
+		if err := os.Rename(path+suffix, backup+suffix); err != nil {
+			return fmt.Errorf("preserving corrupt index cache: %w", err)
+		}
+	}
+	logger.Warningf("[DB_INTEGRITY] preserved damaged index cache at %s", backup)
+	return nil
+}
+
 func createIndexDB(name string, journalMode string, lockingMode string, batchSize int, cacheSizeMB int, disableReuse bool) (*IndexDB, error) {
 	var persistentFile string
+	synchronous := "OFF"
 	if !disableReuse {
 		// Reuse enabled (default): use persistent file
 		persistentFile = fmt.Sprintf("index_%s.db", name)
+		synchronous = "FULL"
+		if journalMode == "OFF" || journalMode == "" {
+			journalMode = "DELETE"
+		}
 	}
 	// If disableReuse is true, persistentFile stays empty and a temp file will be created
 
@@ -47,11 +77,11 @@ func createIndexDB(name string, journalMode string, lockingMode string, batchSiz
 		SoftHeapLimitBytes:  16 * 1024 * 1024, // 16MB soft heap limit (reduced to minimize memory pressure)
 		CacheSpillThreshold: 2000,             // Spill dirty pages to disk when cache exceeds 2000 pages (~8MB)
 		MmapSize:            0,                // Disable mmap to prevent additional OS page cache usage
-		Synchronous:         "OFF",            // No sync for maximum performance - safe since DB can be rebuilt
-		TempStore:           "FILE",           // FILE instead of MEMORY to reduce memory usage
-		JournalMode:         journalMode,      // Configurable journal mode
-		LockingMode:         lockingMode,      // Configurable locking mode
-		PersistentFile:      persistentFile,   // Use fixed filename or empty for temp file
+		Synchronous:         synchronous,
+		TempStore:           "FILE",         // FILE instead of MEMORY to reduce memory usage
+		JournalMode:         journalMode,    // Configurable journal mode
+		LockingMode:         lockingMode,    // Configurable locking mode
+		PersistentFile:      persistentFile, // Use fixed filename or empty for temp file
 	})
 	if err != nil {
 		return nil, err
@@ -86,7 +116,18 @@ func NewIndexDB(name string, journalMode string, batchSize int, cacheSizeMB int,
 
 	idxDB, err := createIndexDB(name, journalMode, "", batchSize, cacheSizeMB, disableReuse)
 	if err != nil {
-		return nil, false, err
+		if disableReuse || !sqlitebusy.IsCorrupt(err) {
+			return nil, false, err
+		}
+		path := filepath.Join(settings.Config.Server.CacheDir, "sql", fmt.Sprintf("index_%s.db", name))
+		if err := quarantineIndexFile(path); err != nil {
+			return nil, false, err
+		}
+		idxDB, err = createIndexDB(name, journalMode, "", batchSize, cacheSizeMB, disableReuse)
+		if err != nil {
+			return nil, false, err
+		}
+		isNewDb = true
 	}
 
 	// For persistent databases, check integrity on startup
@@ -94,6 +135,10 @@ func NewIndexDB(name string, journalMode string, batchSize int, cacheSizeMB int,
 	if !disableReuse {
 		mode := normalizeStartupIntegrityMode(settings.Config.Server.IndexSqlConfig.StartupIntegrityCheck)
 		if err := idxDB.runStartupIntegrityCheck(mode); err != nil {
+			if !errors.Is(err, errIndexRebuild) {
+				idxDB.Close()
+				return nil, false, err
+			}
 			// Database was recreated due to corruption
 			logger.Warningf("[DB_INIT] SQLite database was found with issues which could be due to a dirty shutdown, recreating: tmp/index_%s.db", name)
 			isNewDb = true
@@ -111,7 +156,22 @@ func NewIndexDB(name string, journalMode string, batchSize int, cacheSizeMB int,
 		idxDB.Close()
 		return nil, false, err
 	}
-	go idxDB.startPeriodicCleanup()
+	if !disableReuse {
+		var revision int
+		if err := idxDB.QueryRow("PRAGMA user_version").Scan(&revision); err != nil {
+			idxDB.Close()
+			return nil, false, err
+		}
+		if revision < 1 {
+			// Reconcile caches produced by the age-pruning/size-rollup bugs once.
+			// The existing rows remain in place; successful scans repair them.
+			if _, err := idxDB.Exec("PRAGMA user_version = 1"); err != nil {
+				idxDB.Close()
+				return nil, false, err
+			}
+			isNewDb = true
+		}
+	}
 	return idxDB, isNewDb, nil
 }
 
@@ -154,8 +214,7 @@ func (db *IndexDB) checkAccessibilityProbe() error {
 	var n int
 	err := db.QueryRow(`SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'index_items'`).Scan(&n)
 	if err != nil {
-		logger.Warningf("[DB_INTEGRITY] probe: cannot read sqlite_master: %v", err)
-		return db.deleteCorruptedDatabase()
+		return db.handleIntegrityError(err)
 	}
 	if n == 0 {
 		logger.Debugf("[DB_INTEGRITY] probe: index_items not present yet (new database), skipping row read")
@@ -168,8 +227,7 @@ func (db *IndexDB) checkAccessibilityProbe() error {
 		return nil
 	}
 	if err != nil {
-		logger.Warningf("[DB_INTEGRITY] probe: cannot read index_items: %v", err)
-		return db.deleteCorruptedDatabase()
+		return db.handleIntegrityError(err)
 	}
 	return nil
 }
@@ -187,8 +245,7 @@ func (db *IndexDB) checkIntegrityAndRecreateIfNeeded() error {
 	err := db.QueryRow("PRAGMA quick_check").Scan(&result)
 	if err != nil {
 		// If we can't even run the check, assume corruption
-		logger.Warningf("[DB_INTEGRITY] Cannot run integrity check: %v", err)
-		return db.deleteCorruptedDatabase()
+		return db.handleIntegrityError(err)
 	}
 
 	if result != "ok" {
@@ -208,34 +265,14 @@ func (db *IndexDB) deleteCorruptedDatabase() error {
 	// Close the database connection first
 	db.Close()
 
-	// Delete the main database file
-	if err := os.Remove(dbPath); err != nil && !os.IsNotExist(err) {
-		return fmt.Errorf("failed to delete corrupted database: %w", err)
+	if err := quarantineIndexFile(dbPath); err != nil {
+		return err
 	}
-
-	// Delete any associated WAL/shm files
-	_ = os.Remove(dbPath + "-wal")
-	_ = os.Remove(dbPath + "-shm")
-
-	return fmt.Errorf("database was corrupted and deleted - will be recreated")
+	return errIndexRebuild
 }
 
-// startPeriodicCleanup starts a background goroutine that cleans up stale database entries every 24 hours.
-// Stale entries are items where last_updated is older than 24 hours.
-func (db *IndexDB) startPeriodicCleanup() {
-	cleanupInterval := 24 * time.Hour
-	ticker := time.NewTicker(cleanupInterval)
-	time.Sleep(cleanupInterval)
-	for range ticker.C {
-		logger.Infof("[DB_MAINTENANCE] Starting periodic cleanup of stale index entries (older than 24 hours)")
-		deletedCount, err := db.DeleteStaleItemsOlderThan(cleanupInterval)
-		if err != nil {
-			logger.Errorf("[DB_MAINTENANCE] Failed to cleanup stale entries: %v", err)
-		} else if deletedCount > 0 {
-			logger.Infof("[DB_MAINTENANCE] Cleaned up %d stale index entries", deletedCount)
-		}
-	}
-}
+// Age alone does not make an index row stale: unchanged directories are deliberately
+// skipped by quick scans. Only successful scans may prune missing entries.
 
 func (db *IndexDB) CreateIndexTable() error {
 	query := `
@@ -1003,6 +1040,7 @@ func (db *IndexDB) UpdateFolderSizesIfChanged(source string, pathSizes map[strin
 	var setCaseParts []string
 	var whereCaseParts []string
 	var args []interface{}
+	var whereArgs []interface{}
 	var paths []string
 	var placeholders []string
 
@@ -1010,7 +1048,7 @@ func (db *IndexDB) UpdateFolderSizesIfChanged(source string, pathSizes map[strin
 		setCaseParts = append(setCaseParts, "WHEN path = ? THEN ?")
 		whereCaseParts = append(whereCaseParts, "WHEN path = ? THEN ?")
 		args = append(args, path, size)
-		args = append(args, path, size) // Duplicate for WHERE clause
+		whereArgs = append(whereArgs, path, size)
 		paths = append(paths, path)
 		placeholders = append(placeholders, "?")
 	}
@@ -1030,6 +1068,7 @@ func (db *IndexDB) UpdateFolderSizesIfChanged(source string, pathSizes map[strin
 	for _, path := range paths {
 		args = append(args, path)
 	}
+	args = append(args, whereArgs...)
 
 	startTime := time.Now()
 	for attempt := 1; attempt <= dbTransientOpAttempts; attempt++ {

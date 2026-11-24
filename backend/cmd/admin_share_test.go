@@ -3,13 +3,14 @@ package cmd
 import (
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
 	"github.com/gtsteffaniak/filebrowser/backend/internal/app"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/users"
-	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/state"
+	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 )
 
 func TestAdminHasSharePermissionAfterPlaywrightStartup(t *testing.T) {
@@ -88,6 +89,9 @@ func TestAdminHasSharePermissionAfterSettingsMigration(t *testing.T) {
 }
 
 func TestGrahamGainsAccessAfterSettingsMigrationStartup_dockerSourcePaths(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("Docker fixture contains Unix source paths; native Windows migration is tested separately")
+	}
 	t.Setenv("FILEBROWSER_ONLYOFFICE_SECRET", "")
 	configPath := filepath.Join(t.TempDir(), "config.yaml")
 	configYAML := `server:

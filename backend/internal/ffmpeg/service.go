@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"path/filepath"
+	"runtime"
 	"strings"
 
 	goffmpeg "github.com/gtsteffaniak/go-ffmpeg"
@@ -35,6 +37,18 @@ type InitOptions struct {
 
 // Initialize creates the global ffmpeg service and runs capability detection.
 func Initialize(ctx context.Context, opts InitOptions) error {
+	if opts.FFmpegPath == "" {
+		name := "ffmpeg"
+		if runtime.GOOS == "windows" {
+			name += ".exe"
+		}
+		if exe, err := os.Executable(); err == nil {
+			bundled := filepath.Join(filepath.Dir(exe), "media", name)
+			if stat, err := os.Stat(bundled); err == nil && !stat.IsDir() {
+				opts.FFmpegPath = bundled
+			}
+		}
+	}
 	if opts.MaxConcurrent < 1 {
 		opts.MaxConcurrent = 4
 	}

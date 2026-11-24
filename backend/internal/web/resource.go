@@ -2,6 +2,8 @@ package web
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
@@ -729,13 +731,23 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 	fullIndexPath := utils.JoinScopedIndexPath(userscope, path)
 
 	// get scoped path
-	realPath, _, _ := idx.GetRealPath(fullIndexPath)
+	realPath, err := resolveUploadPath(idx, userscope, fullIndexPath)
+	if err != nil {
+		return http.StatusForbidden, err
+	}
+	unlockUpload, lockErr := lockUploadWrite(r.Context(), realPath)
+	if lockErr != nil {
+		return http.StatusRequestTimeout, lockErr
+	}
+	defer unlockUpload()
 
+	canAcknowledgeCompleted := d.Share.Hash != ""
 	if d.Share.Hash == "" {
 		filePerms, permErr := effectiveFilePerms(d, source)
 		if permErr != nil {
 			return http.StatusForbidden, permErr
 		}
+		canAcknowledgeCompleted = filePerms.Create || filePerms.Modify
 		_, statErr := os.Stat(realPath)
 		if status, gateErr := resourcePostPermCheck(statErr == nil, r.URL.Query().Get("override") == "true", filePerms); gateErr != nil {
 			return status, gateErr
@@ -744,6 +756,26 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 
 	if !state.AccessPermitted(idx.Path, utils.IndexPathFromNormalized(fullIndexPath, true), filePermUser.Username) {
 		return http.StatusForbidden, fmt.Errorf("access denied to path %s", path)
+	}
+	uploadActor := fmt.Sprintf("%d:%s", filePermUser.ID, d.Share.Hash)
+	var lifecycle *uploadLifecycle
+	if r.Header.Get(uploadSessionHeader) != "" {
+		session, err := parseUploadSession(r)
+		if err != nil {
+			return http.StatusBadRequest, err
+		}
+		var finish func()
+		lifecycle, finish, err = beginUploadLifecycle(w, r, realPath, uploadActor, session)
+		if err != nil {
+			return http.StatusGone, err
+		}
+		defer finish()
+	}
+
+	if !isDir && canAcknowledgeCompleted {
+		if handled, status, err := acknowledgeCompletedUpload(w, r, realPath, uploadActor); handled {
+			return status, err
+		}
 	}
 
 	// Check for file/folder conflicts before creation
@@ -769,17 +801,28 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 		dirOpts := fileOpts
 		dirOpts.Path = fullIndexPath
 
+		_, beforeErr := os.Lstat(realPath)
 		err = files.WriteDirectory(dirOpts)
+		if os.IsNotExist(beforeErr) {
+			uploadDirectoryCreated(lifecycle, realPath)
+		}
 		if err != nil {
 			logger.Debugf("error writing directory: %v", err)
 			return ErrToStatus(err), err
 		}
 
+		if uploadCancelled(lifecycle) {
+			return http.StatusGone, fmt.Errorf("upload cancelled")
+		}
 		activity.RecordUpload(r, toActor(d), source, path, true)
 		return http.StatusOK, nil
 	}
 
 	// Handle Chunked Uploads
+	expectedFileDigest, digestErr := uploadDigestHeader(r, "X-File-SHA256")
+	if digestErr != nil {
+		return http.StatusBadRequest, digestErr
+	}
 	chunkOffsetStr := r.Header.Get("X-File-Chunk-Offset")
 	if chunkOffsetStr != "" {
 		var offset int64
@@ -809,7 +852,7 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 			logger.Debugf("%v", sessionErr)
 			return http.StatusBadRequest, sessionErr
 		}
-		if acquireErr := activeUploadSessions.acquire(realPath, sessionID); acquireErr != nil {
+		if acquireErr := activeUploadSessions.acquire(realPath, sessionID, uploadActor); acquireErr != nil {
 			if isUploadSessionConflict(acquireErr) {
 				logger.Debugf("%v", acquireErr)
 				drainRequestBody(r)
@@ -848,75 +891,87 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 		}
 
 		// Use a temporary file for chunks.
-		tempFilePath := uploadTempPath(realPath, sessionID)
-		// Create or open the temporary file
-		var outFile *os.File
-		outFile, err = os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY, fileutils.PermFile)
+		tempFilePath := uploadActorTempPath(realPath, sessionID, uploadActor)
+
+		// A completed replacement can be retried after its final response was lost.
+		if _, statErr := os.Stat(tempFilePath); os.IsNotExist(statErr) && offset > 0 && expectedFileDigest != "" {
+			if stat, err := os.Stat(realPath); err == nil && stat.Size() == totalSize && verifyUploadFile(realPath, expectedFileDigest) == nil {
+				staged, size, _, err := stageUploadChunk(r, realPath, totalSize-offset)
+				if err != nil {
+					if strings.HasPrefix(err.Error(), "could not receive upload chunk:") {
+						return http.StatusInternalServerError, err
+					}
+					return http.StatusBadRequest, err
+				}
+				staged.Close()
+				os.Remove(staged.Name())
+				if offset+size != totalSize {
+					return http.StatusBadRequest, fmt.Errorf("incomplete final retry")
+				}
+				activeUploadSessions.release(realPath, sessionID, uploadActor)
+				return http.StatusOK, writeChunkUploadResponse(w, totalSize, totalSize, true)
+			}
+		}
+		outFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_RDWR, fileutils.PermFile)
 		if err != nil {
-			logger.Debugf("could not open temp file: %v", err)
-			return http.StatusInternalServerError, fmt.Errorf("could not open temp file: %v", err)
+			return http.StatusInternalServerError, err
 		}
 		defer outFile.Close()
-
-		// Seek to the correct offset to write the chunk
-		_, err = outFile.Seek(offset, 0)
+		current, err := outFile.Stat()
 		if err != nil {
-			logger.Debugf("could not seek in temp file: %v", err)
-			return http.StatusInternalServerError, fmt.Errorf("could not seek in temp file: %v", err)
+			return http.StatusInternalServerError, err
 		}
-
-		// Write the request body (the chunk) to the file
+		if offset > current.Size() {
+			outFile.Close()
+			os.Remove(tempFilePath)
+			activeUploadSessions.release(realPath, sessionID, uploadActor)
+			drainRequestBody(r)
+			return http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("missing earlier chunks; restart this upload")
+		}
 		var chunkSize int64
-		chunkSize, err = io.Copy(outFile, r.Body)
-		if err != nil {
-			logger.Debugf("could not write chunk to temp file: %v", err)
-			if truncErr := outFile.Truncate(offset); truncErr != nil {
-				logger.Debugf("could not truncate temp file after failed chunk (offset=%d): %v", offset, truncErr)
-			}
-			_ = outFile.Sync()
-
-			gracefulPause := false
-			if d.Share.Hash != "" {
-				k := publicPauseUploadCacheKey(d.Share.Hash, source, path)
-				if _, ok := publicPauseCache.Get(k); ok {
-					gracefulPause = true
-					publicPauseCache.Delete(k)
+		if offset < current.Size() {
+			// Overlapping retries only compare verified bytes; never rewrite a prefix.
+			staged, size, digest, err := stageUploadChunk(r, realPath, totalSize-offset)
+			if err != nil {
+				if strings.HasPrefix(err.Error(), "could not receive upload chunk:") {
+					return http.StatusInternalServerError, err
 				}
-			} else {
-				k := pauseUploadCacheKey(source, path)
-				if _, ok := pauseCache.Get(k); ok {
-					gracefulPause = true
-					pauseCache.Delete(k)
+				return http.StatusBadRequest, err
+			}
+			staged.Close()
+			os.Remove(staged.Name())
+			chunkSize = size
+			if offset+size > current.Size() {
+				outFile.Close()
+				os.Remove(tempFilePath)
+				activeUploadSessions.release(realPath, sessionID, uploadActor)
+				return http.StatusRequestedRangeNotSatisfiable, fmt.Errorf("chunk overlaps the accepted upload boundary")
+			}
+			previous, err := fileRangeDigest(outFile, offset, size)
+			if err != nil || previous != digest {
+				outFile.Close()
+				os.Remove(tempFilePath)
+				activeUploadSessions.release(realPath, sessionID, uploadActor)
+				return http.StatusUnprocessableEntity, fmt.Errorf("retry bytes differ from the accepted chunk; restart this upload")
+			}
+			if offset+size < totalSize {
+				return http.StatusOK, writeChunkUploadResponse(w, offset+size, totalSize, false)
+			}
+		} else {
+			// New contiguous bytes are streamed once into the unpublished file.
+			chunkSize, err = appendVerifiedUploadChunk(r, outFile, offset, totalSize)
+			if err != nil {
+				if strings.HasPrefix(err.Error(), "could not receive upload chunk:") {
+					return http.StatusInternalServerError, err
 				}
+				return http.StatusBadRequest, err
 			}
-
-			// Keep the partial temp file so the client can resume from offset.
-			if gracefulPause {
-				logger.Debugf("chunk upload ended after graceful pause; keeping partial file (source=%s path=%s)", source, path)
-				return 499, nil
-			}
-			logger.Debugf("chunk upload failed; keeping partial file for resume (source=%s path=%s offset=%d)", source, path, offset)
-			return http.StatusInternalServerError, fmt.Errorf("could not write chunk to temp file: %v", err)
-		}
-
-		if err = validateReceivedBytes(chunkSize, 0, false, r.ContentLength); err != nil {
-			logger.Debugf("incomplete chunk: %v", err)
-			if truncErr := outFile.Truncate(offset); truncErr != nil {
-				logger.Debugf("could not truncate temp file after incomplete chunk (offset=%d): %v", offset, truncErr)
-			}
-			_ = outFile.Sync()
-			return http.StatusBadRequest, err
-		}
-
-		if err = validateAssembledSize(offset, chunkSize, totalSize); err != nil {
-			logger.Debugf("%v", err)
-			if truncErr := outFile.Truncate(offset); truncErr != nil {
-				logger.Debugf("could not truncate temp file after oversized chunk (offset=%d): %v", offset, truncErr)
-			}
-			_ = outFile.Sync()
-			return http.StatusBadRequest, err
 		}
 		assembled := offset + chunkSize
+
+		if uploadCancelled(lifecycle) {
+			return http.StatusGone, fmt.Errorf("upload cancelled")
+		}
 
 		// Finalize only when the assembled size matches the declared total exactly.
 		if assembled == totalSize {
@@ -937,7 +992,15 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 			}
 			// close file before moving
 			outFile.Close()
+			if err = verifyUploadFile(tempFilePath, expectedFileDigest); err != nil {
+				_ = os.Remove(tempFilePath)
+				activeUploadSessions.release(realPath, sessionID, uploadActor)
+				return http.StatusUnprocessableEntity, err
+			}
 			// Move the completed file from the temp location to the final destination
+			if uploadCancelled(lifecycle) {
+				return http.StatusGone, fmt.Errorf("upload cancelled")
+			}
 			err = files.MoveResource(false, source, source, tempFilePath, realPath)
 			if err != nil {
 				logger.Debugf("could not move file from %v to %v: %v", tempFilePath, realPath, err)
@@ -945,7 +1008,9 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 			}
 			reconcileSharesAfterMove(false, source, source, tempFilePath, realPath)
 			activity.RecordUpload(r, toActor(d), source, path, false)
-			activeUploadSessions.release(realPath, sessionID)
+			uploadPublished(lifecycle)
+			rememberCompletedUpload(realPath, uploadActor, sessionID, expectedFileDigest, totalSize)
+			activeUploadSessions.release(realPath, sessionID, uploadActor)
 		}
 		if err = writeChunkUploadResponse(w, assembled, totalSize, assembled == totalSize); err != nil {
 			logger.Debugf("could not write chunk upload response: %v", err)
@@ -991,7 +1056,7 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 		logger.Debugf("%v", sessionErr)
 		return http.StatusBadRequest, sessionErr
 	}
-	if acquireErr := activeUploadSessions.acquire(realPath, sessionID); acquireErr != nil {
+	if acquireErr := activeUploadSessions.acquire(realPath, sessionID, uploadActor); acquireErr != nil {
 		if isUploadSessionConflict(acquireErr) {
 			logger.Debugf("%v", acquireErr)
 			return http.StatusConflict, acquireErr
@@ -1000,45 +1065,67 @@ func ResourcePostHandler(w http.ResponseWriter, r *http.Request, d *Context) (in
 		return http.StatusInternalServerError, acquireErr
 	}
 
-	tempFilePath := uploadTempPath(realPath, sessionID)
+	tempFilePath := uploadActorTempPath(realPath, sessionID, uploadActor)
 	outFile, err := os.OpenFile(tempFilePath, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, fileutils.PermFile)
 	if err != nil {
 		logger.Debugf("could not open temp file: %v", err)
 		return http.StatusInternalServerError, fmt.Errorf("could not open temp file: %v", err)
 	}
 
-	written, copyErr := io.Copy(outFile, r.Body)
+	expectedBodyDigest, digestErr := uploadDigestHeader(r, "X-File-Chunk-SHA256")
+	if digestErr != nil {
+		outFile.Close()
+		os.Remove(tempFilePath)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
+		return http.StatusBadRequest, digestErr
+	}
+	bodyDigest := sha256.New()
+	written, copyErr := io.Copy(io.MultiWriter(outFile, bodyDigest), r.Body)
+	if copyErr == nil {
+		copyErr = outFile.Sync()
+	}
 	closeErr := outFile.Close()
 	if copyErr != nil {
 		_ = os.Remove(tempFilePath)
-		activeUploadSessions.release(realPath, sessionID)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
 		logger.Debugf("error writing file: %v", copyErr)
 		return ErrToStatus(copyErr), copyErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(tempFilePath)
-		activeUploadSessions.release(realPath, sessionID)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
 		logger.Debugf("error closing temp file: %v", closeErr)
 		return http.StatusInternalServerError, closeErr
 	}
 
 	if err = validateReceivedBytes(written, totalSize, hasTotalSize, r.ContentLength); err != nil {
 		_ = os.Remove(tempFilePath)
-		activeUploadSessions.release(realPath, sessionID)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
 		logger.Debugf("%v", err)
 		return http.StatusBadRequest, err
 	}
+	actualDigest := hex.EncodeToString(bodyDigest.Sum(nil))
+	if (expectedBodyDigest != "" && expectedBodyDigest != actualDigest) || (expectedFileDigest != "" && expectedFileDigest != actualDigest) {
+		os.Remove(tempFilePath)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
+		return http.StatusUnprocessableEntity, fmt.Errorf("upload SHA-256 mismatch; original destination was kept unchanged")
+	}
 
+	if uploadCancelled(lifecycle) {
+		return http.StatusGone, fmt.Errorf("upload cancelled")
+	}
 	err = files.MoveResource(false, source, source, tempFilePath, realPath)
 	if err != nil {
 		_ = os.Remove(tempFilePath)
-		activeUploadSessions.release(realPath, sessionID)
+		activeUploadSessions.release(realPath, sessionID, uploadActor)
 		logger.Debugf("error writing file: %v", err)
 		return ErrToStatus(err), err
 	}
 	reconcileSharesAfterMove(false, source, source, tempFilePath, realPath)
 	activity.RecordUpload(r, toActor(d), source, path, false)
-	activeUploadSessions.release(realPath, sessionID)
+	uploadPublished(lifecycle)
+	rememberCompletedUpload(realPath, uploadActor, sessionID, expectedFileDigest, written)
+	activeUploadSessions.release(realPath, sessionID, uploadActor)
 	return http.StatusOK, nil
 }
 

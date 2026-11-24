@@ -1,0 +1,13 @@
+http:
+  listen: 127.0.0.1
+  port: 8080
+server:
+  database:
+    path: ./filebrowser.sqlite
+  sources:
+    - path: ./files
+auth:
+  methods:
+    password:
+      enabled: true
+      signup: false

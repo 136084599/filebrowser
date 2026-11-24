@@ -94,6 +94,7 @@ export default {
   name: "move-copy",
   components: { FileList, LoadingSpinner, PathPickerButton },
   props: {
+    promptId: { type: Number, default: null },
     operation: {
       type: String,
       required: true,
@@ -117,6 +118,9 @@ export default {
     isLoading: false, // Track loading state for spinner
     showNewDirInput: false, // When true will replace the new folder button with a input field
     newDirName: "",
+    waitingForConflict: false,
+    conflictPromptId: null,
+    resolveChoice: /** @type {null | ((option: string | null) => void)} */ (null),
   }),
   computed: {
     destContainsSrc() {
@@ -194,6 +198,9 @@ export default {
     if (this.operationInProgress) {
       this.isLoading = true;
     }
+  },
+  beforeUnmount() {
+    this.resolveChoice?.(null);
   },
   methods: {
     syncFileListFromPicker() {
@@ -277,9 +284,10 @@ export default {
     },
     performOperation: async function (event) {
       event.preventDefault();
-      if (this.isLoading) {
+      if (this.isLoading || this.waitingForConflict) {
         return;
       }
+      const ownerId = this.promptId ?? getters.currentPrompt()?.id;
       this.isLoading = true; // Show loading spinner
       try {
         // Ensure destination source is set
@@ -329,30 +337,30 @@ export default {
             return item.from === targetPath && item.fromSource === this.destSource;
           });
 
-          await new Promise((resolve, reject) => {
-            mutations.showPrompt({
+          this.waitingForConflict = true;
+          const option = await new Promise(resolve => {
+            this.resolveChoice = resolve;
+            this.conflictPromptId = mutations.showPrompt({
               name: "replace-rename",
               pinned: true,
+              parentId: ownerId,
               props: {
                 isSameFile: isSameFile,
                 operation: this.operation
               },
-              confirm: async (event, option) => {
-                overwrite = option === "overwrite";
-                rename = option === "rename";
-                event.preventDefault();
-                try {
-                  this.isLoading = true;
-                  result = await action(overwrite, rename);
-                  resolve(); // Resolve the promise if action succeeds
-                } catch (e) {
-                  reject(e); // Reject the promise if an error occurs
-                } finally {
-                  this.isLoading = false;
-                }
-              },
+              confirm: (event, choice) => { event.preventDefault(); resolve(choice); },
+              cancel: () => resolve(null),
             });
           });
+          this.resolveChoice = null;
+          this.waitingForConflict = false;
+          mutations.closeTopPrompt(this.conflictPromptId);
+          this.conflictPromptId = null;
+          if (option === null) return;
+          overwrite = option === 'overwrite';
+          rename = option === 'rename';
+          this.isLoading = true;
+          result = await action(overwrite, rename);
         } else {
           // Await the action call for non-conflicting cases
           result = await action(overwrite, rename);
@@ -389,8 +397,7 @@ export default {
 
         if (shouldNavigate && currentItemMoved) {
           eventBus.emit('itemsMoved');
-          mutations.closeTopPrompt(); // close conflict prompt
-          mutations.closeTopPrompt(); // close moveCopy prompt
+          mutations.closeTopPrompt(ownerId);
 
           if (!hasFailures || hasSuccesses) {
             notify.showSuccessToast(this.$t("prompts.moveSuccess"));
@@ -411,8 +418,7 @@ export default {
 
           // Only close prompts and reload on success (or partial success)
           mutations.setReload(true);
-          mutations.closeTopPrompt(); // close conflict prompt
-          mutations.closeTopPrompt(); // close moveCopy prompt after conflict is resolved and file copied/moved
+          mutations.closeTopPrompt(ownerId);
           mutations.setSearch(false); // close search if open
 
           // Only show success notification if there were no failures (or partial success was already shown)
@@ -468,6 +474,8 @@ export default {
         notifyOperationError(errorMessage);
       } finally {
         this.isLoading = false; // Hide loading spinner
+        this.waitingForConflict = false;
+        this.resolveChoice = null;
       }
     },
   },

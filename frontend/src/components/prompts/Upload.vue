@@ -65,6 +65,11 @@
           <i class="material-symbols file-icon">{{ file.type === "directory" ? "folder" : "insert_drive_file" }}</i> <!-- eslint-disable-line @intlify/vue-i18n/no-raw-text -->
           <div class="file-info">
             <p class="file-name">{{ file.name }}</p>
+            <p v-if="file.cancelling" class="file-name upload-detail">{{ $t('transfer.uploadCancelling') }}</p>
+            <p v-if="!file.retrying && (file.preparingIntegrity || file.verifyingIntegrity)" class="file-name">{{ $t('transfer.verifying') }}</p>
+            <p v-if="file.retrying && file.status === 'uploading'" class="file-name upload-detail" role="status">{{ $t('transfer.uploadRetrying', { count: file.retryAttempt, max: uploadManager.MAX_REQUEST_RETRIES, seconds: file.retrySeconds, reason: file.retryReason }) }}</p>
+            <p v-if="file.status === 'error'" class="file-name upload-detail upload-error" role="alert">{{ file.errorDetails }}</p>
+            <p v-if="file.status === 'paused'" class="file-name">{{ $t('general.paused') }}</p>
             <progress-bar v-if="file.type !== 'directory'" :val="file.status === 'completed'
                 ? $t('prompts.completed')
                 : file.status === 'error'
@@ -124,6 +129,7 @@
             <button
               type="button"
               @click="cancelUpload(file.id)"
+              :disabled="file.cancelling"
               class="action"
               :aria-label="$t('general.cancel')"
               :title="$t('general.cancel')"
@@ -156,6 +162,16 @@
       :title="$t('buttons.resumeAll')"
     >
       {{ $t("buttons.resumeAll") }}
+    </button>
+    <button
+      v-if="canCancelAll"
+      type="button"
+      @click="uploadManager.cancelAll()"
+      class="button button--flat button--red"
+      :disabled="uploadManager.control.cancelling"
+      :title="$t('transfer.uploadCancelHelp')"
+    >
+      {{ $t(uploadManager.control.cancelling ? 'transfer.uploadCancelling' : 'transfer.uploadCancelAll') }}
     </button>
     <button
       type="button"
@@ -200,6 +216,7 @@ export default {
     ButtonGroup,
   },
   props: {
+    promptId: { type: Number, default: null },
     initialItems: {
       type: Object,
       default: null,
@@ -242,6 +259,7 @@ export default {
     const isDragging = ref(false);
     const showConflictPrompt = ref(false);
     let conflictResolver = null;
+    let conflictPromptId = null;
 
     let wakeLock = null;
 
@@ -269,9 +287,10 @@ export default {
 
     const handleConflict = (resolver, options = {}) => {
       conflictResolver = resolver;
-      mutations.showPrompt({
+      conflictPromptId = mutations.showPrompt({
         name: "replace-rename",
         pinned: true,
+        parentId: props.promptId,
         props: {
           allowSkip: !getters.isShare(),
           allowRename: options.allowRename !== false,
@@ -288,18 +307,21 @@ export default {
             resolveConflict(false);
           }
         },
+        cancel: () => { conflictResolver?.(false); conflictResolver = null; },
       });
     };
 
     const resolveConflict = (overwrite) => {
-      if (conflictResolver) {
-        conflictResolver(overwrite);
-      }
-      mutations.closeTopPrompt(); // Only close the conflict prompt, return to upload prompt
+      const resolver = conflictResolver;
+      conflictResolver = null;
+      mutations.closeTopPrompt(conflictPromptId);
+      conflictPromptId = null;
+      resolver?.(overwrite);
     };
 
     const showRenamePrompt = () => {
-      mutations.closeTopPrompt(); // Only close the replace-rename prompt, keep upload prompt open
+      mutations.closeTopPrompt(conflictPromptId);
+      conflictPromptId = null;
       // Get the conflicting folder name from the upload queue
       const conflictingFolder = uploadManager.getConflictingFolder();
       if (!conflictingFolder) {
@@ -309,9 +331,9 @@ export default {
 
       mutations.showPrompt({
         name: "rename",
-        confirm: (newName) => {
-          void renameUploadFolder(conflictingFolder, newName);
-        },
+        parentId: props.promptId,
+        confirm: (newName) => renameUploadFolder(conflictingFolder, newName),
+        cancel: () => { conflictResolver?.(false); conflictResolver = null; },
         props: { folderName: conflictingFolder }
       });
     };
@@ -322,19 +344,20 @@ export default {
         const existingItems = new Set(state.req.items.map(i => i.name));
         if (existingItems.has(newName)) {
           notify.showError(new Error(`A folder named "${newName}" already exists`));
-          return;
+          return false;
         }
 
         // Update upload manager with the new folder name
         await uploadManager.renameFolder(oldName, newName);
 
         // Resolve the conflict and continue upload
-        if (conflictResolver) {
-          conflictResolver({ rename: newName });
-        }
-        mutations.closeTopPrompt(); // Only close the rename prompt, return to upload prompt
+        const resolver = conflictResolver;
+        conflictResolver = null;
+        resolver?.({ rename: newName });
+        return true;
       } catch (error) {
         console.error(error);
+        return false;
       }
     };
 
@@ -398,6 +421,7 @@ export default {
         !canPauseAll.value &&
         files.value.some((file) => file.status === "paused")
     );
+    const canCancelAll = computed(() => uploadManager.control.cancelling || files.value.some(file => file.status !== 'completed'));
 
     const close = () => {
       mutations.closeTopPrompt();
@@ -407,7 +431,7 @@ export default {
       uploadManager.clearCompleted();
     };
 
-    const handleVisibilityChange = async () => {
+    const handleVisibilityChange = () => {
       if (document.visibilityState === "visible" && isUploading.value) {
         void acquireWakeLock();
       }
@@ -452,7 +476,7 @@ export default {
     };
 
     onMounted(async () => {
-      document.addEventListener("visibilitychange", void handleVisibilityChange);
+      document.addEventListener("visibilitychange", handleVisibilityChange);
       window.addEventListener("beforeunload", handleBeforeUnload);
       uploadManager.setOnConflict(handleConflict);
       if (props.initialItems) {
@@ -461,7 +485,7 @@ export default {
     });
 
     onUnmounted(() => {
-      document.removeEventListener("visibilitychange", void handleVisibilityChange);
+      document.removeEventListener("visibilitychange", handleVisibilityChange);
       window.removeEventListener("beforeunload", handleBeforeUnload);
       uploadManager.setOnConflict(() => {}); // cleanup
       releaseWakeLock();
@@ -609,14 +633,14 @@ export default {
         name: "replace",
         pinned: true,
         confirm: () => {
-          uploadManager.retry(file.id, true);
+          void uploadManager.retry(file.id, true);
           mutations.closeTopPrompt();
         },
       });
     };
 
     const cancelUpload = (id) => {
-      uploadManager.cancel(id);
+      void uploadManager.cancel(id);
     };
 
     const getStatusText = (status, file) => {
@@ -645,9 +669,7 @@ export default {
       if (file.status === 'error' && file.errorDetails) {
         return file.errorDetails;
       }
-      if (file.status === 'paused' && file.connectionIssue) {
-        return 'Connection stalled - upload paused. Click resume to retry.';
-      }
+      if (file.retrying) return file.retryReason;
       if (file.connectionIssue && file.status === 'error') {
         return file.errorDetails || 'Connection issue detected. Click retry to resume.';
       }
@@ -685,6 +707,7 @@ export default {
       renameUploadFolder,
       canPauseAll,
       canResumeAll,
+      canCancelAll,
       handleConflictAction,
       maxConcurrentUpload,
       uploadChunkSizeMb,
@@ -698,6 +721,13 @@ export default {
 </script>
 
 <style scoped>
+.upload-detail {
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+.upload-error {
+  color: var(--errorColor, #c62828);
+}
 .upload-prompt {
   text-align: center;
   padding: 2em;

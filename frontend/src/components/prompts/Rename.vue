@@ -8,7 +8,7 @@
     <div v-show="!renaming">
       <p>{{ $t("prompts.renameMessage") }}</p>
 
-      <div v-if="item.type !== 'directory'" class="filename-inputs">
+      <div v-if="renameItem.type !== 'directory'" class="filename-inputs">
       <input ref="filenameInput" aria-label="New Name" class="input" :class="{ 'form-invalid': !validation.valid }" v-focus type="text" @keydown="onKeydown" @keyup="onKeyup" v-model.trim="fileName" @input="updateFullName" />
       <span class="extension-separator">.</span> <!--eslint-disable-line @intlify/vue-i18n/no-raw-text-->
       <input class="input extension-input" type="text" @keydown="onKeydown" @keyup="onKeyup" v-model.trim="fileExtension" @input="updateFullName" />
@@ -35,7 +35,7 @@
     >
       {{ $t("general.cancel") }}
     </button>
-    <button @click="submit" class="button button--flat" :disabled="!canRename"
+    <button @click="submit" class="button button--flat" :disabled="!canRename || renaming"
       type="submit" :aria-label="$t('general.submit')" :title="$t('general.submit')">
       {{ $t("general.rename") }}
     </button>
@@ -55,9 +55,10 @@ export default {
     LoadingSpinner,
   },
   props: {
+    promptId: { type: Number, default: null },
+    folderName: { type: String, default: null },
     item: {
       type: Object,
-      required: true,
       default: () => ({ source: "", path: "", name: "" })
     },
     parentItems: {  // Parent items for comparison of filenames in a preview
@@ -66,10 +67,10 @@ export default {
     }
   },
   data() {
-    const itemName = this.item.name;
+    const itemName = this.folderName ?? this.item.name;
     let fileName = "";
     let fileExtension = "";
-    if (this.item.type !== 'directory') {
+    if (this.folderName === null && this.item.type !== 'directory') {
       const ext = getFileExtension(this.item.name);
       const filenamePrefix = this.item.name.substring(0, this.item.name.length - ext.length);
       fileName = filenamePrefix;
@@ -83,19 +84,19 @@ export default {
     };
   },
   computed: {
-    closeTopPrompt() {
-      return mutations.closeTopPrompt();
+    renameItem() {
+      return this.folderName === null ? this.item : { name: this.folderName, type: 'directory' };
     },
     validation() {
       return this.validateFileName(this.name);
     },
     canRename() {
       // Enable the button only if the name is different from the original, and if the filename field is not empty
-      const hasValidFileName = this.item.type === 'directory'
+      const hasValidFileName = this.renameItem.type === 'directory'
         ? this.name.trim() !== ''
         : this.fileName.trim() !== '';
       return this.validation.valid &&
-             this.name !== this.item.name &&
+             this.name !== this.renameItem.name &&
              hasValidFileName;
     },
     isPreviewView() {
@@ -105,7 +106,7 @@ export default {
   mounted() {
     this.$nextTick(() => {
       // Auto-focus filename input field
-      if (this.item.type !== 'directory') {
+      if (this.renameItem.type !== 'directory') {
         const filenameInput = this.$refs.filenameInput;
         filenameInput?.select();
       } else {
@@ -115,6 +116,7 @@ export default {
     });
   },
   methods: {
+    closeTopPrompt() { mutations.dismissPrompt(this.promptId ?? undefined); },
     onKeydown(event) {
       // Allow "esc" key to close prompt and block other shortcuts
       // e.g. in plyrViewer we have "P" and "L", without this we can't type those letters
@@ -132,7 +134,7 @@ export default {
     },
     updateFullName() {
       // Combine filename and extension
-      if (this.item.type !== 'directory') {
+      if (this.renameItem.type !== 'directory') {
         this.name = this.fileExtension 
           ? `${this.fileName}.${this.fileExtension}`
           : this.fileName;
@@ -147,7 +149,7 @@ export default {
         return { valid: true };
       }
 
-      const isFolder = this.item.type === "directory";
+      const isFolder = this.renameItem.type === "directory";
 
       // Check for forbidden characters in file names
       if (!isFolder) {
@@ -158,7 +160,7 @@ export default {
       }
 
       // Get the current item's name for comparison
-      const currentItemName = this.item.name.toLowerCase();
+      const currentItemName = this.renameItem.name.toLowerCase();
       const newName = value.toLowerCase();
 
       // If renaming to the same name (case-insensitive), allow it
@@ -189,11 +191,23 @@ export default {
       return (p || '').replace(/^\/+|\/+$/g, '');
     },
     async submit() {
+      if (this.renaming) return;
       // remove trailing slashes
       if (this.name.endsWith("/") || this.name.endsWith("\\")) {
         this.name = this.name.substring(0, this.name.length - 1);
       }
       if (!this.validation.valid || !this.canRename) return;
+      const ownerId = this.promptId ?? getters.currentPrompt()?.id;
+      if (this.folderName !== null) {
+        const prompt = state.prompts.find(entry => entry.id === ownerId);
+        if (typeof prompt?.confirm !== 'function') return;
+        this.renaming = true;
+        try {
+          if (await prompt.confirm(this.name) !== false) mutations.closeTopPrompt(ownerId);
+        } catch (error) { notify.showError(error.message || String(error)); }
+        finally { this.renaming = false; }
+        return;
+      }
       // Remove trailing slashes from the source path before calculating parent directory
       let sourcePath = this.item.path;
       while (sourcePath.endsWith("/") || sourcePath.endsWith("\\")) {
@@ -218,7 +232,7 @@ export default {
         }
         notify.showSuccessToast(this.$t("prompts.renameSuccess"));
         eventBus.emit('itemsRenamed');
-        mutations.closeTopPrompt();
+        mutations.closeTopPrompt(ownerId);
 
         if (this.isPreviewView) {
           // Navigate only if we rename the file that we're currently previewing (eg: from fileTree)

@@ -231,14 +231,18 @@ func NewTempDB(id string, config ...*TempDBConfig) (*TempDB, error) {
 	// busy_timeout is set in the DSN so every pooled connection honors it.
 	db, err := sql.Open(SqliteDriver, sqlitebusy.WithBusyTimeout(tmpPath))
 	if err != nil {
-		os.Remove(tmpPath)
+		if cfg.PersistentFile == "" {
+			os.Remove(tmpPath)
+		}
 		return nil, fmt.Errorf("failed to open SQLite database: %w", err)
 	}
 
 	// Test the connection
 	if err := db.Ping(); err != nil {
 		db.Close()
-		os.Remove(tmpPath)
+		if cfg.PersistentFile == "" {
+			os.Remove(tmpPath)
+		}
 		return nil, fmt.Errorf("failed to ping SQLite database: %w", err)
 	}
 
@@ -328,7 +332,9 @@ func NewTempDB(id string, config ...*TempDBConfig) (*TempDB, error) {
 	for _, pragma := range basePragmas {
 		if _, err := db.Exec(pragma.sql); err != nil {
 			db.Close()
-			os.Remove(tmpPath)
+			if cfg.PersistentFile == "" {
+				os.Remove(tmpPath)
+			}
 			return nil, fmt.Errorf("%s: %w", pragma.err, err)
 		}
 	}

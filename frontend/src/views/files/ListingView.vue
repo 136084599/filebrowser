@@ -197,6 +197,7 @@ import {
 
 export default {
   name: "listingView",
+  emits: ['listing-ready'],
   components: {
     Item,
     Upload,
@@ -223,6 +224,9 @@ export default {
     };
   },
   watch: {
+    loading(value) {
+      if (!value) this.$nextTick(() => this.$emit('listing-ready'));
+    },
     gallerySize() {
       this.columnWidth = 250 + state.user.gallerySize * 50;
     },
@@ -479,6 +483,7 @@ export default {
     },
   },
   mounted() {
+    if (!this.loading) this.$nextTick(() => this.$emit('listing-ready'));
     mutations.setSearch(false);
     this.lastSelected = state.selected;
 

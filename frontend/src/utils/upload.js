@@ -4,6 +4,7 @@ import { mutations, state } from "@/store";
 import { getters } from "@/store/getters";
 import { notify } from "@/notify";
 import i18n from "@/i18n";
+import { prepareUploadIntegrity, validateChunkAcknowledgement } from "@/utils/uploadIntegrity";
 import {
   notifyUploadComplete,
   notifyUploadError,
@@ -106,7 +107,12 @@ class UploadManager {
     this.probedDirs = new Set(); // Track directories that were probed/created during conflict check
     this.progressTimeouts = new Map(); // Track progress timeouts per upload ID
     this.lastUploadActivityTime = null;
-    this.PROGRESS_TIMEOUT_MS = 10000; // 10 seconds without upload activity = pause
+    this.PROGRESS_TIMEOUT_MS = 120000;
+    this.VERIFY_TIMEOUT_MS = 30 * 60 * 1000;
+    this.MAX_REQUEST_RETRIES = 5;
+    this.control = reactive({ cancelling: false });
+    this.probedDirectorySessions = new Map();
+    this.cleanupDirectories = new Map();
   }
 
   setOnConflict(handler) {
@@ -249,13 +255,16 @@ class UploadManager {
             [...topLevelDirs].map(async (dirName) => {
               try {
                 const testPath = `${basePath}${dirName}`;
+                const sessionId = newUploadSessionId();
+                const headers = { 'X-File-Upload-Session': sessionId };
                 if (getters.isShare()) {
-                  await resourcesApi.postPublic(state.shareInfo?.hash, testPath, new Blob([]), false, undefined, {}, true);
+                  await resourcesApi.postPublic(state.shareInfo?.hash, testPath, new Blob([]), false, undefined, headers, true);
                 } else {
-                  await resourcesApi.post(state.req?.source, testPath, new Blob([]), false, undefined, {}, true);
+                  await resourcesApi.post(state.req?.source, testPath, new Blob([]), false, undefined, headers, true);
                 }
                 // No conflict - directory was created successfully
                 // Mark it so we can skip it later in the queue
+                this.probedDirectorySessions.set(dirName, sessionId);
                 return { dirName, conflict: false, probed: true };
               } catch (err) {
                 // 409 means conflict
@@ -278,6 +287,7 @@ class UploadManager {
           );
         }
 
+        this.probedDirs = probedDirs;
         if (conflictingDirs.length > 0) {
           // Store the conflicting folder name (take the first one for now)
           this.conflictingFolder = conflictingDirs[0];
@@ -360,17 +370,17 @@ class UploadManager {
         const dirName = pathParts[pathParts.length - 1];
 
         // Skip top-level directories that were already created during probing
-        if (pathParts.length === 1 && this.probedDirs.has(dirName)) {
-          continue;
-        }
+        const probedSession = pathParts.length === 1 && this.probedDirs.has(dirName)
+          ? this.probedDirectorySessions.get(dirName) : null;
 
         const upload = {
           id: this.nextId++,
-          sessionId: newUploadSessionId(),
+          sessionId: probedSession || newUploadSessionId(),
+          shareHash: getters.isShare() ? state.shareInfo?.hash : null,
           name: dirName,
           size: 0,
           progress: 0,
-          status: "pending",
+          status: probedSession ? "completed" : "pending",
           type: "directory",
           isToplevelDir: pathParts.length === 1,
           path: `${basePath}${dir}`,
@@ -391,6 +401,7 @@ class UploadManager {
       const upload = {
         id,
         sessionId: newUploadSessionId(),
+        shareHash: getters.isShare() ? state.shareInfo?.hash : null,
         file,
         name: item.uploadName || file.name,
         size: file.size,
@@ -415,11 +426,13 @@ class UploadManager {
     }
 
     this.queue.push(...newUploads, ...fileUploads);
+    for (const upload of newUploads) this.cleanupDirectories.set(upload.id, upload);
 
     // Clean up pending items after successful add
     this.pendingItems = null;
     this.conflictingFolder = null;
     this.probedDirs.clear();
+    this.probedDirectorySessions.clear();
 
     void this.processQueue();
     return newUploads;
@@ -439,13 +452,13 @@ class UploadManager {
       this.activeUploads < maxConcurrent &&
       this.hasPending()
     ) {
-      const upload = this.queue.find((item) => item.status === "pending");
+      const upload = this.queue.find((item) => item.status === "pending" && !item.running && this.directoryParentsReady(item));
       if (upload) {
         if (this.overwriteAll) {
           upload.overwrite = true;
         }
         this.start(upload.id);
-      }
+      } else break;
     }
 
     // Update isUploading state based on whether there are active or pending uploads
@@ -463,9 +476,19 @@ class UploadManager {
       if (!hasErrorsOrConflicts) {
         mutations.setReload(true);
       }
+      if (this.queue.every(upload => upload.status === 'completed')) this.cleanupDirectories.clear();
       this.hadActiveUploads = false; // Reset the flag
       this.overwriteAll = null; // Reset for next batch of uploads
     }
+  }
+
+  directoryParentsReady(upload) {
+    const path = `${upload.path.replace(/\/+$/, '')}/`;
+    return ![...this.cleanupDirectories.values()].some(directory => {
+      if (directory.id === upload.id || directory.source !== upload.source || directory.shareHash !== upload.shareHash) return false;
+      const parent = `${directory.path.replace(/\/+$/, '')}/`;
+      return path !== parent && path.startsWith(parent) && directory.status !== 'completed';
+    });
   }
 
   start(id) {
@@ -487,29 +510,36 @@ class UploadManager {
 
   async startDirectoryUpload(upload) {
     this.activeUploads++;
+    upload.running = true;
     this.hadActiveUploads = true; // Mark that we've had active uploads
     upload.status = "uploading";
 
     try {
-      if (getters.isShare()) {
-        await resourcesApi.postPublic(state.shareInfo?.hash, upload.path, new Blob([]), upload.overwrite, undefined, {}, true);
-      } else {
-        await resourcesApi.post(upload.source, upload.path, new Blob([]), upload.overwrite, undefined, {}, true);
-      }
+      const headers = { 'X-File-Upload-Session': upload.sessionId };
+      const promise = upload.shareHash
+        ? resourcesApi.postPublic(upload.shareHash, upload.path, new Blob([]), upload.overwrite, undefined, headers, true)
+        : resourcesApi.post(upload.source, upload.path, new Blob([]), upload.overwrite, undefined, headers, true);
+      upload.xhrPromise = promise;
+      await promise;
 
-      upload.status = "completed";
-      upload.progress = 100;
-      notifyUploadComplete(upload);
+      if (upload.status === "uploading") {
+        upload.status = "completed";
+        upload.progress = 100;
+        notifyUploadComplete(upload);
+      }
     } catch (err) {
       await this.handleUploadError(upload, err);
     } finally {
       this.activeUploads--;
+      upload.running = false;
+      upload.xhrPromise = null;
       void this.processQueue();
     }
   }
 
   async startFileUpload(upload) {
     this.activeUploads++;
+    upload.running = true;
     this.hadActiveUploads = true; // Mark that we've had active uploads
     upload.status = "uploading";
 
@@ -520,30 +550,18 @@ class UploadManager {
     // Single-shot upload when chunking is disabled or file is smaller than chunk size.
     if (chunkSize === 0 || upload.size < chunkSize) {
       const progress = (percent) => {
+        if (percent === 100) upload.verifyingIntegrity = true;
         this.updateProgress(upload, percent);
       };
 
-      // Start progress timeout monitoring
-      upload.lastProgressTime = Date.now();
-      this.startProgressTimeout(upload);
-
       try {
-        let promise;
-        if (getters.isShare()) {
-          promise = resourcesApi.postPublic(state.shareInfo?.hash, upload.path, upload.file, upload.overwrite, progress, {
-            "X-File-Upload-Session": upload.sessionId,
-            "X-File-Total-Size": upload.size,
-          });
-        } else {
-          promise = resourcesApi.post(upload.source, upload.path, upload.file, upload.overwrite, progress, {
-            "X-File-Upload-Session": upload.sessionId,
-            "X-File-Total-Size": upload.size,
-          });
-        }
-
-        upload.xhrPromise = promise;
-        upload.xhr = promise.xhr;
-        await promise;
+        const integrity = await prepareUploadIntegrity(upload, upload.file, false, () => this.recordUploadActivity(upload));
+        if (upload.status !== "uploading") throw new Error("Upload aborted");
+        await this.sendFileRequest(upload, upload.file, progress, {
+          "X-File-Upload-Session": upload.sessionId,
+          "X-File-Total-Size": upload.size,
+          ...integrity.headers,
+        });
 
         this.recordUploadActivity(upload);
         // Clear timeout on successful completion
@@ -556,17 +574,15 @@ class UploadManager {
         this.clearProgressTimeout(upload.id);
         await this.handleUploadError(upload, err);
       } finally {
+        upload.verifyingIntegrity = false;
         this.activeUploads--;
+        upload.running = false;
         upload.xhr = null;
         upload.xhrPromise = null;
         void this.processQueue();
       }
       return;
     }
-
-    // Start progress timeout monitoring for chunked uploads
-    upload.lastProgressTime = Date.now();
-    this.startProgressTimeout(upload);
 
     // Chunked upload loop: The server supports resuming from any chunk offset.
     // Each chunk is written atomically at the specified offset using Seek().
@@ -580,6 +596,7 @@ class UploadManager {
       );
 
       const chunkProgress = (percent) => {
+        if (percent === 100 && upload.chunkOffset + chunk.size === upload.size) upload.verifyingIntegrity = true;
         const chunkLoaded = (percent / 100) * chunk.size;
         const totalLoaded = upload.chunkOffset + chunkLoaded;
         const progress = (totalLoaded / upload.size) * 100;
@@ -587,38 +604,16 @@ class UploadManager {
       };
 
       try {
-        let promise;
-        if (getters.isShare()) {
-          promise = resourcesApi.postPublic(
-            state.shareInfo?.hash,
-            upload.path,
-            chunk,
-            upload.overwrite,
-            chunkProgress,
-            {
-              "X-File-Upload-Session": upload.sessionId,
-              "X-File-Chunk-Offset": upload.chunkOffset,
-              "X-File-Total-Size": upload.size,
-            }
-          );
-        } else {
-          promise = resourcesApi.post(
-            upload.source,
-            upload.path,
-            chunk,
-            upload.overwrite,
-            chunkProgress,
-            {
-              "X-File-Upload-Session": upload.sessionId,
-              "X-File-Chunk-Offset": upload.chunkOffset,
-              "X-File-Total-Size": upload.size,
-            }
-          );
-        }
-
-        upload.xhrPromise = promise;
-        upload.xhr = promise.xhr;
-        await promise;
+        const integrity = await prepareUploadIntegrity(upload, chunk, true, () => this.recordUploadActivity(upload));
+        if (upload.status !== "uploading") throw new Error("Upload aborted");
+        const response = await this.sendFileRequest(upload, chunk, chunkProgress, {
+          "X-File-Upload-Session": upload.sessionId,
+          "X-File-Chunk-Offset": upload.chunkOffset,
+          "X-File-Total-Size": upload.size,
+          ...integrity.headers,
+        });
+        validateChunkAcknowledgement(response, upload.chunkOffset + chunk.size, upload.size);
+        upload.verifyingIntegrity = false;
 
         // Only increment chunkOffset after successful chunk upload.
         // This ensures that if we pause/error mid-chunk, we'll retry that chunk on resume.
@@ -644,9 +639,70 @@ class UploadManager {
     }
 
     this.activeUploads--;
+    upload.running = false;
+    upload.verifyingIntegrity = false;
     upload.xhr = null;
     upload.xhrPromise = null;
     void this.processQueue();
+  }
+
+  isConnectionError(err) {
+    const status = err?.status ?? err?.response?.status;
+    if (status) return false;
+    return err?.code === "UPLOAD_IDLE" || /network|timeout|timed out|connection|failed to fetch/i.test(err?.message || "");
+  }
+
+  isRetryableError(err) {
+    const status = err?.status ?? err?.response?.status;
+    return this.isConnectionError(err) || [408, 425, 429, 500, 502, 503, 504].includes(status);
+  }
+
+  async sendFileRequest(upload, body, progress, headers) {
+    upload.failedAttempts = 0;
+    for (let attempt = 0; ; attempt++) {
+      if (upload.status !== "uploading" || !this.findById(upload.id)) throw new Error("Upload aborted");
+      upload.retrying = false;
+      upload.idleError = null;
+      upload.connectionIssue = false;
+      this.recordUploadActivity(upload);
+      this.startProgressTimeout(upload);
+      try {
+        const guardedProgress = percent => {
+          if (!upload.idleError && upload.status === "uploading") progress(percent);
+        };
+        const promise = getters.isShare()
+          ? resourcesApi.postPublic(state.shareInfo?.hash, upload.path, body, upload.overwrite, guardedProgress, headers, false, { quietErrors: true })
+          : resourcesApi.post(upload.source, upload.path, body, upload.overwrite, guardedProgress, headers, false, { quietErrors: true });
+        upload.xhrPromise = promise;
+        upload.xhr = promise.xhr;
+        const response = await promise;
+        if (upload.status !== "uploading" || !this.findById(upload.id)) throw new Error("Upload aborted");
+        return response;
+      } catch (error) {
+        const err = upload.idleError || error;
+        if (upload.status !== "uploading" || !this.findById(upload.id)) throw new Error("Upload aborted", { cause: error });
+        if (!this.isRetryableError(err) || attempt >= this.MAX_REQUEST_RETRIES) {
+          upload.failedAttempts = attempt;
+          throw err;
+        }
+        this.clearProgressTimeout(upload.id);
+        upload.retrying = true;
+        upload.retryAttempt = attempt + 1;
+        upload.retrySeconds = Math.min(2 ** attempt, 10);
+        upload.retryReason = this.formatErrorMessage(err);
+        upload.connectionIssue = true;
+        upload.verifyingIntegrity = false;
+        upload.progress = upload.size ? Math.round(upload.chunkOffset / upload.size * 1000) / 10 : 0;
+        await new Promise((resolve, reject) => {
+          const timer = setTimeout(() => { upload.cancelRetry = null; resolve(); }, upload.retrySeconds * 1000);
+          upload.cancelRetry = () => { clearTimeout(timer); upload.cancelRetry = null; reject(new Error("Upload aborted")); };
+        });
+      } finally {
+        this.clearProgressTimeout(upload.id);
+        upload.xhrPromise = null;
+        upload.xhr = null;
+      }
+    }
   }
 
   chunkSizeBytes() {
@@ -692,20 +748,20 @@ class UploadManager {
     if (upload?.status !== "uploading") {
       return;
     }
+    upload.status = "paused";
+    upload.retrying = false;
+    upload.cancelRetry?.();
+    this.clearProgressTimeout(id);
+    // Start the best-effort pause signal before aborting, without waiting for
+    // another browser connection to become available.
+    let signal;
     if (upload.type !== "directory" && this.chunkSizeBytes() > 0 && upload.size >= this.chunkSizeBytes()) {
-      try {
-        if (getters.isShare()) {
-          await resourcesApi.signalUploadPause(null, upload.path, state.shareInfo.hash);
-        } else {
-          await resourcesApi.signalUploadPause(upload.source, upload.path, null);
-        }
-      } catch (e) {
-        console.warn("upload pause signal failed", e);
-      }
+      signal = getters.isShare()
+        ? resourcesApi.signalUploadPause(null, upload.path, state.shareInfo.hash)
+        : resourcesApi.signalUploadPause(upload.source, upload.path, null);
     }
     this.abortUpload(upload);
-    upload.status = "paused";
-    this.clearProgressTimeout(id);
+    try { await signal; } catch (e) { console.warn("upload pause signal failed", e); }
   }
 
   clearProgressTimeout(id) {
@@ -729,19 +785,22 @@ class UploadManager {
     const timeoutId = setTimeout(() => {
       this.progressTimeouts.delete(upload.id);
       if (upload.status === "uploading") {
+        if (upload.preparingIntegrity || upload.retrying) {
+          this.startProgressTimeout(upload);
+          return;
+        }
         const lastActivity = Math.max(
           upload.lastProgressTime ?? 0,
           this.lastUploadActivityTime ?? 0
         );
         const idleTime = Date.now() - lastActivity;
-        if (idleTime < this.PROGRESS_TIMEOUT_MS) {
-          this.startProgressTimeout(upload, this.PROGRESS_TIMEOUT_MS - idleTime);
+        const limit = upload.verifyingIntegrity ? this.VERIFY_TIMEOUT_MS : this.PROGRESS_TIMEOUT_MS;
+        if (idleTime < limit) {
+          this.startProgressTimeout(upload, limit - idleTime);
           return;
         }
-        console.log(`Upload ${upload.id} stalled - no progress for ${this.PROGRESS_TIMEOUT_MS}ms, pausing`);
-        upload.connectionIssue = true;
-        void this.pause(upload.id);
-        upload.errorDetails = "Connection stalled - upload paused. Click resume to retry.";
+        upload.idleError = Object.assign(new Error("Upload connection timed out"), { code: "UPLOAD_IDLE" });
+        this.abortUpload(upload);
       }
     }, delay);
 
@@ -772,24 +831,87 @@ class UploadManager {
     }
   }
 
-  cancel(id) {
-    const upload = this.findById(id);
-    if (upload?.status === "uploading" || upload?.status === "paused") {
-      this.abortUpload(upload);
+  stopForCancellation(upload) {
+    upload.status = "cancelled";
+    upload.cancelling = true;
+    upload.cleanupPending = false;
+    upload.retrying = false;
+    upload.cancelRetry?.();
+    this.clearProgressTimeout(upload.id);
+    this.abortUpload(upload);
+  }
+
+  async cancel(id) {
+    const upload = this.findById(id) || this.cleanupDirectories.get(id);
+    if (!upload) return true;
+    if (upload.status === 'completed') {
+      const index = this.queue.findIndex(item => item.id === id);
+      if (index !== -1) this.queue.splice(index, 1);
+      return true;
     }
-    this.clearProgressTimeout(id);
-    const index = this.queue.findIndex((item) => item.id === id);
-    if (index !== -1) {
-      this.queue.splice(index, 1);
+    if (upload.cleanupPromise) return upload.cleanupPromise;
+    this.stopForCancellation(upload);
+    upload.cleanupPromise = (async () => {
+      try {
+        const result = upload.sessionId ? await resourcesApi.cancelUpload(upload.source, upload.path, upload.sessionId, upload.shareHash) : null;
+        if (!result?.ownedDirectory || result.directoryRemoved) this.cleanupDirectories.delete(id);
+        if (!this.control.cancelling && upload.type !== 'directory' && this.queue.every(item => item.id === id || item.status === 'completed' || item.cleanupPending)) {
+          const dirs = [...this.cleanupDirectories.values()].sort((a, b) => b.path.split('/').length - a.path.split('/').length);
+          for (const dir of dirs) { this.stopForCancellation(dir); await this.cancel(dir.id); }
+        }
+        const index = this.queue.findIndex(item => item.id === id);
+        if (index !== -1) this.queue.splice(index, 1);
+        if (!this.control.cancelling && this.queue.every(item => item.status === 'completed')) this.cleanupDirectories.clear();
+        mutations.setReload(true);
+        return true;
+      } catch (error) {
+        upload.status = 'error';
+        upload.cleanupPending = true;
+        upload.errorDetails = i18n.global.t('transfer.uploadCleanupFailed', { reason: this.formatErrorMessage(error) });
+        if (!this.findById(id)) this.queue.push(upload);
+        return false;
+      } finally {
+        upload.cancelling = false;
+        upload.cleanupPromise = null;
+      }
+    })();
+    return upload.cleanupPromise;
+  }
+
+  async cancelAll() {
+    if (this.control.cancelling) return;
+    this.control.cancelling = true;
+    this.isOverallPaused = true;
+    const jobs = [...new Map([
+      ...this.queue.filter(upload => upload.status !== 'completed'),
+      ...this.cleanupDirectories.values(),
+    ].map(upload => [upload.id, upload])).values()];
+    jobs.forEach(upload => this.stopForCancellation(upload));
+    try {
+      const files = jobs.filter(upload => upload.type !== 'directory');
+      for (let i = 0; i < files.length; i += 4) await Promise.all(files.slice(i, i + 4).map(upload => this.cancel(upload.id)));
+      const dirs = jobs.filter(upload => upload.type === 'directory').sort((a, b) => b.path.split('/').length - a.path.split('/').length);
+      for (const upload of dirs) await this.cancel(upload.id);
+      if (!jobs.some(upload => upload.cleanupPending)) notify.showSuccessToast(i18n.global.t('transfer.uploadCancelled'));
+    } finally {
+      this.control.cancelling = false;
+      this.isOverallPaused = false;
+      void this.processQueue();
     }
   }
 
-  retry(id, overwrite = false) {
+  retry(id, overwrite) {
     const upload = this.findById(id);
+    if (upload?.cleanupPending) return this.cancel(id);
     if (upload && ["error", "conflict"].includes(upload.status)) {
-      upload.overwrite = overwrite;
+      if (typeof overwrite === "boolean") upload.overwrite = overwrite;
       upload.status = "pending";
       upload.connectionIssue = false; // Clear connection issue on retry
+      if (upload.error?.status === 416 || upload.error?.status === 422 || upload.restartRequired) {
+        upload.chunkOffset = 0;
+        upload.sessionId = newUploadSessionId();
+        upload.restartRequired = false;
+      }
       const isChunked =
         upload.type !== "directory" && upload.size >= this.chunkSizeBytes();
       const canResume = isChunked && upload.chunkOffset > 0;
@@ -821,11 +943,7 @@ class UploadManager {
       }
       if (state.user.fileLoading?.clearAll) {
         if (status === "error" || status === "conflict" || status === "paused") {
-          if (status === "paused") {
-            this.abortUpload(upload);
-          }
-          this.clearProgressTimeout(upload.id);
-          this.queue.splice(i, 1);
+          void this.cancel(upload.id);
         }
       }
     }
@@ -874,48 +992,23 @@ class UploadManager {
   }
 
   async handleUploadError(upload, err) {
+    if (upload.cancelling || upload.status === 'cancelled') return;
+    upload.verifyingIntegrity = false;
+    upload.retrying = false;
+    upload.restartRequired = err?.status === 416 || err?.status === 422;
     // Check if the error is a 409 Conflict
-    if (err?.response?.status === 409) {
+    if ((err?.status ?? err?.response?.status) === 409) {
       upload.status = "conflict";
       upload.connectionIssue = false;
     } else if (err.message !== "Upload aborted") {
       // Detect connection-related errors
-      const isConnectionError =
-        err.message === "Network error" ||
-        err.message?.toLowerCase().includes("network") ||
-        err.message?.toLowerCase().includes("timeout") ||
-        err.message?.toLowerCase().includes("connection") ||
-        err.message?.toLowerCase().includes("failed to fetch") ||
-        !err.response; // No response usually means network issue
-
-      const isChunked =
-        upload.type !== "directory" && upload.size >= this.chunkSizeBytes();
-      const canResumeChunked =
-        isChunked && upload.chunkOffset > 0 && upload.chunkOffset < upload.size;
-
-      // Connection drops on chunked uploads: pause so Resume continues from last chunk
-      // (same semantics as the stall timeout path).
-      if (isConnectionError && canResumeChunked) {
-        upload.status = "paused";
-        upload.connectionIssue = true;
-        upload.errorDetails =
-          "Connection stalled - upload paused. Click resume to retry.";
-        upload.progress =
-          upload.size > 0
-            ? Math.round((upload.chunkOffset / upload.size) * 1000) / 10
-            : 0;
-        notifyUploadError(upload.name, upload.errorDetails);
-        return;
-      }
+      const isConnectionError = this.isConnectionError(err);
 
       upload.status = "error";
-      if (isConnectionError) {
-        upload.connectionIssue = true;
-        upload.errorDetails = `Connection error: ${this.formatErrorMessage(err)}. Click retry to resume.`;
-      } else {
-        upload.connectionIssue = false;
-        upload.errorDetails = this.formatErrorMessage(err);
-      }
+      upload.connectionIssue = isConnectionError;
+      upload.errorDetails = upload.failedAttempts
+        ? i18n.global.t("transfer.uploadRetriesExhausted", { count: upload.failedAttempts, reason: this.formatErrorMessage(err) })
+        : this.formatErrorMessage(err);
       notifyUploadError(upload.name, upload.errorDetails);
     } else {
       // Upload was aborted - preserve connectionIssue flag if it was already set
@@ -930,6 +1023,7 @@ class UploadManager {
   }
 
   formatErrorMessage(err) {
+    if (err?.code === "UPLOAD_IDLE") return i18n.global.t("transfer.uploadIdle");
     if (err?.response) {
       // API error with response
       const status = err.response.status;

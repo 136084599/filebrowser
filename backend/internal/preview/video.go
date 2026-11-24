@@ -13,7 +13,7 @@ import (
 // videoPath: path to the input video file.
 // percentageSeek: percentage of video duration to seek to (0–100).
 // Returns: JPEG image bytes.
-func (s *Service) GenerateVideoPreview(ctx context.Context, videoPath string, percentageSeek int) ([]byte, error) {
+func (s *Service) GenerateVideoPreview(ctx context.Context, videoPath string, percentageSeek int, width, height int) ([]byte, error) {
 	if s.ffmpegService == nil {
 		logger.Errorf("FFmpeg service not available for file '%s'", videoPath)
 		return nil, fmt.Errorf("FFmpeg service not available")
@@ -26,7 +26,12 @@ func (s *Service) GenerateVideoPreview(ctx context.Context, videoPath string, pe
 	}
 
 	var buf bytes.Buffer
-	err := s.ffmpegService.VideoPreview(ctx, &buf, videoPath, percentageSeek)
+	var err error
+	if width == 0 && height == 0 {
+		err = s.ffmpegService.VideoPreview(ctx, &buf, videoPath, percentageSeek)
+	} else {
+		err = s.ffmpegService.VideoThumbnail(ctx, &buf, videoPath, percentageSeek, width, height)
+	}
 	if err != nil {
 		return nil, err
 	}

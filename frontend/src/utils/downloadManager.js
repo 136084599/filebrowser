@@ -4,6 +4,7 @@ class DownloadManager {
   constructor() {
     this.queue = reactive([]);
     this.nextId = 0;
+    this.generation = 0;
   }
 
   add(file, shareHash = "") {
@@ -79,7 +80,9 @@ class DownloadManager {
 
   /** Abort in-flight downloads, clear the queue, reset ids (fresh Download prompt instance). */
   reset() {
+    this.generation++;
     for (const item of this.queue) {
+      item.status = "cancelled";
       if (item.abortController) {
         try {
           item.abortController.abort();

@@ -651,6 +651,9 @@ func loadConfigWithDefaults(configFile string, generate bool) error {
 	// Expand $VAR / ${VAR} in decoded string scalars only (after parse) so
 	// secrets may contain quotes, backslashes, or newlines safely.
 	expandConfigEnv(rawConfig)
+	if err := convertLegacyConfig(rawConfig); err != nil {
+		return fmt.Errorf("legacy configuration migration: %w", err)
+	}
 
 	// Filter to only keep valid top-level Settings struct fields
 	// This removes anchor definitions that are just templates (e.g., "test_server: &test_server")
@@ -678,7 +681,8 @@ func loadConfigWithDefaults(configFile string, generate bool) error {
 	}
 
 	// check if database is set in the config
-	val, ok := filteredConfig["server"].(map[string]interface{})["database"].(string)
+	serverFields, _ := filteredConfig["server"].(map[string]interface{})
+	val, ok := serverFields["database"].(string)
 	if ok && val != "" {
 		return fmt.Errorf("old database path is set in the config, please migrate your database to SQLite")
 	}

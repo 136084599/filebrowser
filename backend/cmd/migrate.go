@@ -5,8 +5,10 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	bolt "go.etcd.io/bbolt"
 	"os"
 	"path/filepath"
+	"time"
 
 	storm "github.com/asdine/storm/v3"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/access"
@@ -61,7 +63,7 @@ func validateDatabasePaths() error {
 					`and set server.database.migrateFrom to "database.db.old".`,
 			)
 		}
-		if _, err := os.Stat("database.db"); err == nil {
+		if _, err := os.Stat("database.db"); err == nil && boltPath == "" {
 			return migrationErrf(
 				`legacy database file found in the working directory. ` +
 					`Rename it to database.db.old, set server.database.migrateFrom to "database.db.old" ` +
@@ -140,7 +142,7 @@ func migrateFromBoltToSQLite() error {
 	logger.Info("========================================")
 	// Open old BoltDB (read-only)
 	logger.Info("Opening old database...")
-	oldDB, err := storm.Open(oldDBPath)
+	oldDB, err := storm.Open(oldDBPath, storm.BoltOptions(0600, &bolt.Options{ReadOnly: true, Timeout: 3 * time.Second}))
 	if err != nil {
 		return fmt.Errorf("failed to open old database: %w", err)
 	}
@@ -243,6 +245,9 @@ func normalizeUserScopesBeforeSQLite(user *users.User) error {
 	backendScopes, err := users.APIScopesToBackend(user.FrontendScopes)
 	if err != nil {
 		return fmt.Errorf("convert frontend scopes to backend: %w", err)
+	}
+	if len(backendScopes) != len(user.FrontendScopes) {
+		return fmt.Errorf("source mapping would discard %d user scopes; refusing migration", len(user.FrontendScopes)-len(backendScopes))
 	}
 	for i := range backendScopes {
 		backendScopes[i].Permissions = users.SourceFilePermissions{

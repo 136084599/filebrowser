@@ -19,3 +19,8 @@ func isBusyOrLocked(err error) bool {
 	}
 	return sqliteErr.Code == sqlite3.ErrBusy || sqliteErr.Code == sqlite3.ErrLocked
 }
+
+func isCorrupt(err error) bool {
+	var e sqlite3.Error
+	return errors.As(err, &e) && (e.Code == sqlite3.ErrCorrupt || e.Code == sqlite3.ErrNotADB)
+}

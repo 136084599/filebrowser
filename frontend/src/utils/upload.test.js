@@ -1,10 +1,17 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
+// Queue/timing tests isolate the asynchronous hashing work. Integrity and strict
+// acknowledgements are independently tested against known SHA-256 vectors.
+vi.mock("@/utils/uploadIntegrity", () => ({
+  prepareUploadIntegrity: vi.fn(async () => ({ headers: {}, accept() {} })),
+  validateChunkAcknowledgement: vi.fn(),
+}));
 
 vi.mock("@/api", () => ({
   resourcesApi: {
     post: vi.fn(),
     postPublic: vi.fn(),
     signalUploadPause: vi.fn(),
+    cancelUpload: vi.fn(),
     listDirectoryEntries: vi.fn(),
   },
 }));
@@ -47,16 +54,12 @@ function addUpload(status = "uploading", file = new Blob(["a"])) {
   return uploadManager.queue.at(-1);
 }
 
-function deferred() {
-  let resolve;
-  const promise = new Promise((done) => { resolve = done; });
-  return { promise, resolve };
-}
-
 beforeEach(() => {
   vi.useFakeTimers();
   vi.setSystemTime(0);
   vi.clearAllMocks();
+  resourcesApi.post.mockReset();
+  resourcesApi.postPublic.mockReset();
   vi.spyOn(console, "log").mockImplementation(() => {});
   getters.isShare.mockReturnValue(false);
   uploadManager.queue.splice(0);
@@ -65,6 +68,11 @@ beforeEach(() => {
   uploadManager.isOverallPaused = false;
   uploadManager.hadActiveUploads = false;
   uploadManager.lastUploadActivityTime = null;
+  uploadManager.cleanupDirectories.clear();
+  uploadManager.probedDirectorySessions.clear();
+  uploadManager.control.cancelling = false;
+  resourcesApi.cancelUpload.mockReset();
+  resourcesApi.cancelUpload.mockResolvedValue({ cancelled: true });
 });
 
 afterEach(() => {
@@ -76,105 +84,127 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
-describe("upload stall detection", () => {
-  it("allows an upload to wait while another progresses, then detects a batch stall", async () => {
-    const waiting = addUpload();
-    const progressing = addUpload();
-    uploadManager.startProgressTimeout(waiting);
-    uploadManager.startProgressTimeout(progressing);
+describe("upload connection recovery", () => {
+  it("does not pause or abort after a normal 16-second wait", async () => {
+    const upload = addUpload();
+    upload.xhrPromise = { abort: vi.fn() };
+    uploadManager.startProgressTimeout(upload);
+    await vi.advanceTimersByTimeAsync(16000);
+    expect(upload.status).toBe("uploading");
+    expect(upload.xhrPromise.abort).not.toHaveBeenCalled();
+  });
 
-    for (let i = 0; i < 7; i++) {
+  it("lets queued requests wait while sibling requests make progress", async () => {
+    const upload = addUpload();
+    upload.xhrPromise = { abort: vi.fn() };
+    const sibling = addUpload();
+    uploadManager.startProgressTimeout(upload);
+    for (let i = 0; i < 30; i++) {
       await vi.advanceTimersByTimeAsync(5000);
-      // The API rounds progress, so successive events can have the same percent.
-      uploadManager.updateProgress(progressing, 1);
-      expect(waiting.status).toBe("uploading");
+      uploadManager.updateProgress(sibling, 1);
     }
-    await vi.advanceTimersByTimeAsync(9999);
-    expect(waiting.status).toBe("uploading");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(waiting.status).toBe("paused");
-    expect(progressing.status).toBe("paused");
-    expect(waiting.connectionIssue).toBe(true);
-    expect(uploadManager.progressTimeouts.size).toBe(0);
-  });
-
-  it("still pauses a single upload after ten seconds without activity", async () => {
-    const upload = addUpload();
-    uploadManager.startProgressTimeout(upload);
-    await vi.advanceTimersByTimeAsync(9999);
+    expect(upload.xhrPromise.abort).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(upload.xhrPromise.abort).toHaveBeenCalledTimes(1);
+    expect(upload.idleError.code).toBe("UPLOAD_IDLE");
     expect(upload.status).toBe("uploading");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(upload.status).toBe("paused");
   });
 
-  it.each([false, true])("keeps completion activity after a sibling finishes (share=%s)", async (share) => {
-    getters.isShare.mockReturnValue(share);
-    const request = deferred();
-    const post = share ? resourcesApi.postPublic : resourcesApi.post;
-    post.mockReturnValueOnce(request.promise);
-    const waiting = addUpload();
-    const finishing = addUpload("pending");
-    uploadManager.activeUploads = 1;
-    uploadManager.startProgressTimeout(waiting);
-    const done = uploadManager.startFileUpload(finishing);
-
-    await vi.advanceTimersByTimeAsync(9900);
-    request.resolve("");
-    await done;
-    expect(finishing.status).toBe("completed");
-    await vi.advanceTimersByTimeAsync(9999);
-    expect(waiting.status).toBe("uploading");
-    await vi.advanceTimersByTimeAsync(1);
-    expect(waiting.status).toBe("paused");
-  });
-
-  it.each([false, true])("counts a successful chunk even without progress events (share=%s)", async (share) => {
-    getters.isShare.mockReturnValue(share);
-    const first = deferred();
-    const second = deferred();
-    const post = share ? resourcesApi.postPublic : resourcesApi.post;
-    post.mockReturnValueOnce(first.promise).mockReturnValueOnce(second.promise);
-    const waiting = addUpload();
-    const chunked = addUpload("pending", new Blob([new Uint8Array(5 * 1024 * 1024 + 1)]));
-    uploadManager.activeUploads = 1;
-    uploadManager.startProgressTimeout(waiting);
-    const done = uploadManager.startFileUpload(chunked);
-
-    await vi.advanceTimersByTimeAsync(9900);
-    first.resolve("");
-    await vi.advanceTimersByTimeAsync(100);
-    expect(chunked.chunkOffset).toBe(5 * 1024 * 1024);
-    expect(waiting.status).toBe("uploading");
-    second.resolve("");
-    await done;
-  });
-
-  it.each(["pause", "cancel"])("ignores late progress after %s", async (action) => {
+  it("allows slow final verification without a short transfer timeout", async () => {
     const upload = addUpload();
+    upload.verifyingIntegrity = true;
+    upload.xhrPromise = { abort: vi.fn() };
     uploadManager.startProgressTimeout(upload);
-    if (action === "pause") {
-      await uploadManager.pause(upload.id);
-    } else {
-      uploadManager.cancel(upload.id);
-    }
-    uploadManager.updateProgress(upload, 50);
-    expect(uploadManager.progressTimeouts.size).toBe(0);
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(upload.xhrPromise.abort).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(uploadManager.VERIFY_TIMEOUT_MS - 120000);
+    expect(upload.xhrPromise.abort).toHaveBeenCalledTimes(1);
   });
 
-  it("gives a resumed upload a fresh inactivity window", async () => {
-    const upload = addUpload();
-    uploadManager.startProgressTimeout(upload);
-    await uploadManager.pause(upload.id);
-    await vi.advanceTimersByTimeAsync(20000);
-    const request = deferred();
-    resourcesApi.post.mockReturnValueOnce(request.promise);
-    uploadManager.resume(upload.id);
-    await vi.advanceTimersByTimeAsync(9999);
-    expect(upload.status).toBe("uploading");
-    request.resolve("");
+  it.each([false, true])("automatically retries the same unconfirmed chunk (share=%s)", async share => {
+    getters.isShare.mockReturnValue(share);
+    const post = share ? resourcesApi.postPublic : resourcesApi.post;
+    post.mockResolvedValueOnce("").mockRejectedValueOnce(new Error("Network error")).mockResolvedValueOnce("");
+    const upload = addUpload("pending", new Blob([new Uint8Array(5 * 1024 * 1024 + 1)]));
+    const done = uploadManager.startFileUpload(upload);
     await vi.advanceTimersByTimeAsync(0);
+    expect(upload.chunkOffset).toBe(5 * 1024 * 1024);
+    expect(upload.retrying).toBe(true);
+    expect(upload.status).toBe("uploading");
+    await vi.advanceTimersByTimeAsync(1000);
+    await done;
     expect(upload.status).toBe("completed");
+    expect(upload.chunkOffset).toBe(upload.size);
+    expect(post.mock.calls.map(call => call[5]["X-File-Chunk-Offset"])).toEqual([0, 5 * 1024 * 1024, 5 * 1024 * 1024]);
     expect(uploadManager.progressTimeouts.size).toBe(0);
+  });
+
+  it.each([403, 409, 413, 422])("does not retry a permanent HTTP %s error or disguise it as a pause", async status => {
+    resourcesApi.post.mockRejectedValueOnce(Object.assign(new Error("HTTP failure"), { status }));
+    const upload = addUpload("pending");
+    await uploadManager.startFileUpload(upload);
+    expect(resourcesApi.post).toHaveBeenCalledTimes(1);
+    expect(upload.status).toBe(status === 409 ? "conflict" : "error");
+    expect(upload.connectionIssue).toBe(false);
+  });
+
+  it("stops with a visible error after five automatic retries", async () => {
+    resourcesApi.post.mockRejectedValue(new Error("Network error"));
+    const upload = addUpload("pending");
+    const done = uploadManager.startFileUpload(upload);
+    await vi.runAllTimersAsync();
+    await done;
+    expect(resourcesApi.post).toHaveBeenCalledTimes(6);
+    expect(upload.status).toBe("error");
+    expect(upload.errorDetails).toContain("transfer.uploadRetriesExhausted");
+    expect(uploadManager.activeUploads).toBe(0);
+    expect(uploadManager.progressTimeouts.size).toBe(0);
+  });
+
+  it.each(["pause", "cancel"])("cancels the retry timer immediately on manual %s", async action => {
+    resourcesApi.post.mockRejectedValue(new Error("Network error"));
+    const upload = addUpload("pending");
+    const done = uploadManager.startFileUpload(upload);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(upload.retrying).toBe(true);
+    if (action === "pause") await uploadManager.pause(upload.id);
+    else uploadManager.cancel(upload.id);
+    await done;
+    await vi.advanceTimersByTimeAsync(30000);
+    expect(resourcesApi.post).toHaveBeenCalledTimes(1);
+    expect(upload.status).toBe(action === "pause" ? "paused" : "cancelled");
+    expect(uploadManager.activeUploads).toBe(0);
+  });
+
+  it("aborts a stalled request and retries automatically without manual resume", async () => {
+    let rejectRequest;
+    const stalled = new Promise((_, reject) => { rejectRequest = reject; });
+    stalled.abort = () => rejectRequest(new Error("Upload aborted"));
+    resourcesApi.post.mockReturnValueOnce(stalled).mockResolvedValueOnce("");
+    const upload = addUpload("pending");
+    const done = uploadManager.startFileUpload(upload);
+    await vi.advanceTimersByTimeAsync(120000);
+    expect(upload.retrying).toBe(true);
+    expect(upload.status).toBe("uploading");
+    await vi.advanceTimersByTimeAsync(1000);
+    await done;
+    expect(resourcesApi.post).toHaveBeenCalledTimes(2);
+    expect(upload.status).toBe("completed");
+  });
+
+  it("waits for the previous run to settle when a user immediately pauses and resumes", async () => {
+    resourcesApi.post.mockRejectedValueOnce(new Error("Network error")).mockResolvedValueOnce("");
+    const upload = addUpload("pending");
+    const done = uploadManager.startFileUpload(upload);
+    await vi.advanceTimersByTimeAsync(0);
+    void uploadManager.pause(upload.id);
+    uploadManager.resume(upload.id);
+    expect(resourcesApi.post).toHaveBeenCalledTimes(1);
+    await done;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(resourcesApi.post).toHaveBeenCalledTimes(2);
+    expect(upload.status).toBe("completed");
+    expect(uploadManager.activeUploads).toBe(0);
   });
 });
 
@@ -394,5 +424,95 @@ describe("conflicts on loose files", () => {
 
     expect(onConflict).not.toHaveBeenCalled();
     expect(uploadManager.queue).toHaveLength(2);
+  });
+});
+
+
+describe("upload cancellation cleanup", () => {
+  it("stops the entire snapshot before cleanup and preserves completed files", async () => {
+    const completed = addUpload("completed");
+    const paused = addUpload("paused"); paused.sessionId = "paused";
+    const pending = addUpload("pending"); pending.sessionId = "pending";
+    const running = addUpload("uploading"); running.sessionId = "running";
+    running.xhrPromise = { abort: vi.fn() };
+    const directory = addUpload("completed"); directory.type = "directory";
+    directory.path = "/new/child/"; directory.sessionId = "directory";
+    uploadManager.cleanupDirectories.set(directory.id, directory);
+    const statuses = [];
+    resourcesApi.cancelUpload.mockImplementation(async () => {
+      statuses.push([paused.status, pending.status, running.status]);
+      return { cancelled: true };
+    });
+    await uploadManager.cancelAll();
+    expect(statuses.every(row => row.every(status => status === "cancelled"))).toBe(true);
+    expect(running.xhrPromise.abort).toHaveBeenCalled();
+    expect(resourcesApi.cancelUpload).toHaveBeenCalledTimes(4);
+    expect(resourcesApi.cancelUpload.mock.calls.at(-1)[2]).toBe("directory");
+    expect(uploadManager.queue.map(upload => upload.id)).toEqual([completed.id]);
+    expect(resourcesApi.post).not.toHaveBeenCalled();
+    expect(uploadManager.control.cancelling).toBe(false);
+    expect(uploadManager.isOverallPaused).toBe(false);
+  });
+
+  it("keeps a failed cleanup visible and Retry retries cleanup without uploading", async () => {
+    const upload = addUpload("paused"); upload.sessionId = "cleanup-failure";
+    resourcesApi.cancelUpload.mockRejectedValueOnce(new Error("connection offline"));
+    await uploadManager.cancelAll();
+    expect(upload.status).toBe("error");
+    expect(upload.cleanupPending).toBe(true);
+    expect(upload.errorDetails).toContain("uploadCleanupFailed");
+    expect(uploadManager.queue).toHaveLength(1);
+    await uploadManager.retry(upload.id);
+    expect(resourcesApi.cancelUpload).toHaveBeenCalledTimes(2);
+    expect(resourcesApi.post).not.toHaveBeenCalled();
+    expect(uploadManager.queue).toHaveLength(0);
+  });
+
+  it("still cleans new empty directories after their completed rows were cleared", async () => {
+    const directory = addUpload("completed"); directory.type = "directory";
+    directory.sessionId = "owned-empty"; directory.path = "/new/";
+    const paused = addUpload("paused"); paused.sessionId = "remaining";
+    uploadManager.cleanupDirectories.set(directory.id, directory);
+    uploadManager.clearCompleted();
+    expect(uploadManager.queue).toHaveLength(1);
+    await uploadManager.cancelAll();
+    expect(resourcesApi.cancelUpload.mock.calls.map(call => call[2])).toEqual(["remaining", "owned-empty"]);
+  });
+
+  it("retries retained directory cleanup after a failed file cleanup succeeds", async () => {
+    const upload = addUpload("paused"); upload.sessionId = "partial";
+    const directory = addUpload("completed"); directory.type = "directory";
+    directory.sessionId = "folder"; directory.path = "/new/";
+    uploadManager.cleanupDirectories.set(directory.id, directory);
+    resourcesApi.cancelUpload.mockRejectedValueOnce(new Error("offline"))
+      .mockResolvedValueOnce({ ownedDirectory: true, directoryRemoved: false })
+      .mockResolvedValueOnce({ cancelled: true })
+      .mockResolvedValueOnce({ ownedDirectory: true, directoryRemoved: true });
+    await uploadManager.cancelAll();
+    expect(uploadManager.cleanupDirectories.size).toBe(1);
+    expect(upload.cleanupPending).toBe(true);
+    await uploadManager.retry(upload.id);
+    expect(resourcesApi.cancelUpload.mock.calls.map(call => call[2])).toEqual(["partial", "folder", "partial", "folder"]);
+    expect(uploadManager.cleanupDirectories.size).toBe(0);
+    expect(uploadManager.queue).toHaveLength(0);
+  });
+
+  it("removing a completed file row never requests server deletion", async () => {
+    const upload = addUpload("completed"); upload.sessionId = "done";
+    await uploadManager.cancel(upload.id);
+    expect(resourcesApi.cancelUpload).not.toHaveBeenCalled();
+    expect(uploadManager.queue).toHaveLength(0);
+  });
+
+  it("shares one cleanup request across overlapping cancel clicks", async () => {
+    const upload = addUpload("paused"); upload.sessionId = "double-click";
+    let finish;
+    resourcesApi.cancelUpload.mockReturnValue(new Promise(resolve => { finish = resolve; }));
+    const first = uploadManager.cancel(upload.id);
+    const second = uploadManager.cancel(upload.id);
+    expect(resourcesApi.cancelUpload).toHaveBeenCalledTimes(1);
+    finish({ cancelled: true });
+    await Promise.all([first, second]);
+    expect(uploadManager.queue).toHaveLength(0);
   });
 });

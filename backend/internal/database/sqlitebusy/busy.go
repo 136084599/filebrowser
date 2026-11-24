@@ -32,6 +32,8 @@ func IsBusyOrLocked(err error) bool {
 	return err != nil && isBusyOrLocked(err)
 }
 
+func IsCorrupt(err error) bool { return err != nil && isCorrupt(err) }
+
 // Wrap returns err wrapped with ErrBusy when the underlying error is busy/locked.
 // The original error is retained so callers can still inspect the driver result code.
 func Wrap(err error) error {

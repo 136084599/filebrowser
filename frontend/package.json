@@ -24,6 +24,7 @@
     "test": "vitest run "
   },
   "dependencies": {
+    "@noble/hashes": "^1.8.0",
     "@onlyoffice/document-editor-vue": "^1.4.0",
     "ace-builds": "^1.24.2",
     "axios": "^1.13.5",

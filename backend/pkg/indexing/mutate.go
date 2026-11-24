@@ -80,6 +80,7 @@ func (s *Scanner) flushBatch() {
 
 	err := s.idx.db.BulkInsertItems(s.idx.Name, items)
 	if err != nil {
+		s.failed = true
 		logger.Warningf("[DB_TX] Flush failed for scanner [%s] (%d items): %v", s.scanPath, len(items), err)
 	}
 
@@ -135,7 +136,7 @@ func (idx *Index) GetReducedMetadata(target string, isDir bool) (*iteminfo.FileI
 		if !exists {
 			inMemSize = 0
 		}
-		if inMemSize > 0 || item.Size == 0 {
+		if exists {
 			item.Size = int64(inMemSize)
 		}
 	}
@@ -187,7 +188,7 @@ func (idx *Index) GetMetadataInfo(target string, isDir bool, shallow bool) (*ite
 			if !exists {
 				inMemSize = 0
 			}
-			if inMemSize > 0 || child.Size == 0 {
+			if exists {
 				// Use in-memory if available, or if DB also shows 0
 				child.Size = int64(inMemSize)
 			}
@@ -203,7 +204,7 @@ func (idx *Index) GetMetadataInfo(target string, isDir bool, shallow bool) (*ite
 	if !exists {
 		inMemSize = 0
 	}
-	if inMemSize > 0 || dir.Size == 0 {
+	if exists {
 		dir.Size = int64(inMemSize)
 	}
 
@@ -280,31 +281,19 @@ func GetIndexInfo(sourceName string, forceCacheRefresh bool) (ReducedIndex, erro
 		if err != nil {
 			logger.Errorf("Failed to get partition usage for index %s: %v", sourceName, err)
 		}
-		itemInfo, dbErr := idx.db.GetDirectoryChildren(idx.Name, "/")
-		if dbErr != nil {
-			logger.Debugf("GetIndexInfo: could not read root listing from index DB for %s: %v", sourceName, dbErr)
-		}
-		var indexedSizeFromDB uint64
-		for _, item := range itemInfo {
-			isFolder := item.IsDir || item.Type == "directory"
-			if !isFolder {
-				indexedSizeFromDB += uint64(item.Size)
-				continue
-			}
-			folderKey := utils.AddTrailingSlashIfNotExists(item.Path)
-			if agg, ok := idx.GetFolderSize(folderKey); ok {
-				indexedSizeFromDB += agg
-			} else {
-				indexedSizeFromDB += uint64(item.Size)
-			}
-		}
-		idx.SetUsage(aggregate, rootOnly, indexedSizeFromDB)
+		idx.SetUsage(aggregate, rootOnly, idx.UsedAsIndexed)
 		utils.DiskUsageCache.Set(cacheKey, true)
 		if metaStoreConfigured() {
 			if err := idx.writePersistedIndexInfo(); err != nil {
 				logger.Warningf("GetIndexInfo: failed to persist index disk stats for %s: %v", sourceName, err)
 			}
 		}
+	}
+
+	if size, err := idx.indexedRootSize(); err == nil {
+		idx.mu.Lock()
+		idx.UsedAsIndexed = size
+		idx.mu.Unlock()
 	}
 
 	// Build scanner info for client
@@ -354,10 +343,7 @@ func GetIndexInfo(sourceName string, forceCacheRefresh bool) (ReducedIndex, erro
 
 // SetFolderSize sets the size for a directory in the in-memory map
 func (idx *Index) SetFolderSize(path string, newSize uint64) {
-	idx.folderSizesMu.Lock()
-	defer idx.folderSizesMu.Unlock()
-	idx.folderSizes[path] = newSize
-	idx.folderSizesUnsynced[path] = struct{}{} // Mark as changed for next DB sync
+	idx.updateFolderSizeAndParents(path, newSize, 0, true)
 }
 
 // GetFolderSize retrieves the size for a directory from the in-memory map
@@ -366,4 +352,27 @@ func (idx *Index) GetFolderSize(path string) (uint64, bool) {
 	defer idx.folderSizesMu.RUnlock()
 	size, exists := idx.folderSizes[path]
 	return size, exists
+}
+
+func (idx *Index) indexedRootSize() (uint64, error) {
+	items, err := idx.db.GetDirectoryChildren(idx.Name, "/")
+	if err != nil {
+		return 0, err
+	}
+	var total uint64
+	for _, item := range items {
+		size := item.Size
+		if item.IsDir || item.Type == "directory" {
+			if cached, ok := idx.GetFolderSize(utils.AddTrailingSlashIfNotExists(item.Path)); ok {
+				size = int64(cached)
+			}
+			if !idx.Config.UseLogicalSize && size < 4096 {
+				size = 4096
+			}
+		}
+		if size > 0 {
+			total += uint64(size)
+		}
+	}
+	return total, nil
 }

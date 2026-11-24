@@ -5,9 +5,9 @@ import (
 	"strconv"
 	"time"
 
-	"github.com/gtsteffaniak/filebrowser/backend/internal/utils"
 	indexingdb "github.com/gtsteffaniak/filebrowser/backend/internal/database/dbindex"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/events"
+	"github.com/gtsteffaniak/filebrowser/backend/internal/utils"
 	"github.com/gtsteffaniak/go-logger/logger"
 )
 
@@ -196,6 +196,12 @@ func (idx *Index) PostScan() error {
 	idle := idx.activeScannerPath == ""
 	idx.mu.RUnlock()
 	if idle {
+		if size, err := idx.indexedRootSize(); err == nil {
+			idx.SetFolderSize("/", size)
+		}
+		if err := idx.SyncFolderSizesToDB(); err != nil {
+			return err
+		}
 		// All scanners completed
 		err := idx.db.ShrinkMemory()
 		if err != nil {
@@ -247,8 +253,10 @@ func (idx *Index) SendSourceUpdateEvent() error {
 func (idx *Index) setupMultiScanner(isNewDb bool) {
 	// Load persisted index-level stats from Bolt (complexity, numDirs/Files, used/usedAlt/total, etc.)
 	// Scanner-level stats below use a second GetByPath only for the Scanners map.
-	if err := idx.Load(); err != nil {
-		logger.Errorf("Failed to load persisted index data for [%v]: %v", idx.Name, err)
+	if !isNewDb {
+		if err := idx.Load(); err != nil {
+			logger.Errorf("Failed to load persisted index data for [%v]: %v", idx.Name, err)
+		}
 	}
 
 	idx.mu.Lock()
@@ -318,13 +326,16 @@ func (idx *Index) setupMultiScanner(isNewDb bool) {
 		idx.mu.Unlock()
 	}
 
-	if idx.useAdaptiveScheduling() {
+	if idx.useAdaptiveScheduling() && isNewDb {
 		idx.mu.Lock()
 		idx.schedulerStartupPassPending = true
 		idx.mu.Unlock()
 	}
 
 	idx.restoreScannerNextRuns()
+	if !idx.needsAdaptiveBootstrap() {
+		_ = idx.SetStatus(READY)
+	}
 	go idx.runIndexScheduler()
 
 	logger.Debugf("Created %d scanners for [%v] (1 root + %d children)", len(topLevelDirs)+1, idx.Name, len(topLevelDirs))

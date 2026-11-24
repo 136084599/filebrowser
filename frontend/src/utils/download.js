@@ -48,7 +48,7 @@ export default function downloadFiles(items) {
       mutations.showPrompt({
         name: "download",
         confirm: (format) => {
-          mutations.closeTopPrompt();
+          if (format !== 'batch' && format !== 'browser') mutations.closeTopPrompt();
           void startDownload(format, items, state.shareInfo.hash, {
             silentChunkedError: willUseChunkedArchive,
           });
@@ -70,7 +70,7 @@ export default function downloadFiles(items) {
     mutations.showPrompt({
       name: "download",
       confirm: (format) => {
-        mutations.closeTopPrompt();
+        if (format !== 'batch' && format !== 'browser') mutations.closeTopPrompt();
         void startDownload(format, items, "", {
           silentChunkedError: willUseChunkedArchive,
         });
@@ -87,7 +87,7 @@ async function startDownload(config, files, hash = "", options = {}) {
     if (e?.name === "AbortError" || e?.message?.includes("aborted") || e?.message?.includes("cancelled")) {
       return;
     }
-    if (options.silentChunkedError) {
+    if (options.silentChunkedError && config !== 'batch' && config !== 'browser') {
       return;
     }
     notify.showError(`Error downloading: ${e.message || e}`);
@@ -113,7 +113,7 @@ export function showShareDownloadPrompt(items) {
   mutations.showPrompt({
     name: "download",
     confirm: (format) => {
-      mutations.closeTopPrompt();
+      if (format !== 'batch' && format !== 'browser') mutations.closeTopPrompt();
       void startDownload(format, items, state.shareInfo?.hash || "", {
         silentChunkedError: willUseChunkedArchive,
       });

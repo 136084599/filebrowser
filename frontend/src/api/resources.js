@@ -14,6 +14,7 @@ import { isMediaFile } from '@/utils/mediaFile'
 import { getObjectProperty } from '@/utils/object'
 import { getStreamURL, getStreamURLPublic } from './media'
 import { invalidateDirMetadataCache } from '@/utils/metadataCache.js'
+import { startBatchDownload, startBrowserDownloads } from '@/utils/batchDownload.js'
 
 export { fetchPreviewImage } from '@/utils/previewRequests'
 
@@ -203,6 +204,18 @@ export async function signalUploadPause(source, path, shareHash) {
   await fetchURL(apiPath, { method: 'POST' })
 }
 
+export async function cancelUpload(source, path, sessionId, shareHash) {
+  const apiPath = shareHash
+    ? getPublicApiPath('resources/cancel-upload', { hash: shareHash, path })
+    : getApiPath('resources/cancel-upload', { source, path });
+  const response = await fetchURL(apiPath, {
+    method: 'POST',
+    headers: { ...(shareHash ? sharePublicAuthHeaders(shareHash) : {}), 'X-File-Upload-Session': sessionId },
+    signal: AbortSignal.timeout(30000),
+  });
+  return response.json();
+}
+
 async function resourceAction(source, path, method, content) {
   if (!source || source === undefined || source === null) {
     throw new Error('no source provided')
@@ -286,6 +299,10 @@ export async function put(source, path, content = '') {
 }
 
 export async function download(format, files, shareHash = "") {
+  if (format === 'batch' || format === 'browser') {
+    if (shareHash) throw new Error('Please sign in to use directory batch downloads');
+    return format === 'browser' ? startBrowserDownloads(files) : startBatchDownload(files);
+  }
   const downloadChunkSizeMb = state.user?.fileLoading?.downloadChunkSizeMb || 0
   const sizeThreshold = downloadChunkSizeMb * 1024 * 1024
 
@@ -790,7 +807,8 @@ export function post(
   overwrite = false,
   onupload,
   headers = {},
-  isDir = false
+  isDir = false,
+  options = {}
 ) {
   if (!source || source === undefined || source === null) {
     throw new Error('no source provided')
@@ -826,9 +844,6 @@ export function post(
         Object.entries(headers).forEach(([header, value]) => {
           request.setRequestHeader(header, value);
         });
-        if (headers["X-File-Chunk-Offset"] !== undefined) {
-          request.setRequestHeader("Connection", "close");
-        }
 
         if (typeof onupload === "function") {
           request.upload.onprogress = (event) => {
@@ -875,7 +890,7 @@ export function post(
                 const error = new Error(errorMessage);
                 error.status = request.status;
                 error.response = { status: request.status, responseText: request.responseText };
-                notify.showError(errorMessage);
+                if (!options.quietErrors) notify.showError(errorMessage);
                 reject(error);
               });
             return;
@@ -890,7 +905,7 @@ export function post(
           const error = new Error(errorMessage);
           error.status = request.status;
           error.response = { status: request.status, responseText: request.responseText };
-          notify.showError(errorMessage);
+          if (!options.quietErrors) notify.showError(errorMessage);
           reject(error);
         };
 
@@ -1337,7 +1352,8 @@ export function postPublic(
   overwrite = false,
   onupload,
   headers = {},
-  isDir = false
+  isDir = false,
+  options = {}
 ) {
   if (!hash || hash === undefined || hash === null) {
     throw new Error('no hash provided')
@@ -1357,9 +1373,6 @@ export function postPublic(
     Object.entries(headers).forEach(([header, value]) => {
       request.setRequestHeader(header, value);
     });
-    if (headers["X-File-Chunk-Offset"] !== undefined) {
-      request.setRequestHeader("Connection", "close");
-    }
 
     if (typeof onupload === "function") {
       request.upload.onprogress = (event) => {
@@ -1391,20 +1404,20 @@ export function postPublic(
 
           const error = new Error(errorMessage);
           error.status = request.status;
-          notify.showError(errorMessage);
+          if (!options.quietErrors) notify.showError(errorMessage);
           reject(error);
         }
       };
 
       request.onerror = () => {
         const error = new Error("Network error");
-        notify.showError("Network error during upload");
+        if (!options.quietErrors) notify.showError("Network error during upload");
         reject(error);
       };
 
       request.onabort = () => {
         const error = new Error("Upload aborted");
-        notify.showError("Upload was aborted");
+        if (!options.quietErrors) notify.showError("Upload was aborted");
         reject(error);
       };
 

@@ -99,14 +99,29 @@ func (f *FileCache) Store(ctx context.Context, key string, value []byte) error {
 		return err
 	}
 
-	if err := os.WriteFile(fileName, value, fileutils.PermFile); err != nil {
+	tmp, err := os.CreateTemp(filepath.Dir(fileName), ".preview-*")
+	if err != nil {
 		return err
 	}
-
-	return nil
+	defer os.Remove(tmp.Name())
+	if err := tmp.Chmod(fileutils.PermFile); err != nil {
+		tmp.Close()
+		return err
+	}
+	if _, err := tmp.Write(value); err != nil {
+		tmp.Close()
+		return err
+	}
+	if err := tmp.Close(); err != nil {
+		return err
+	}
+	return os.Rename(tmp.Name(), fileName)
 }
 
 func (f *FileCache) Load(ctx context.Context, key string) (value []byte, exist bool, err error) {
+	mu := f.getScopedLocks(key)
+	mu.Lock()
+	defer mu.Unlock()
 	r, ok, err := f.open(key)
 	if err != nil || !ok {
 		return nil, ok, err

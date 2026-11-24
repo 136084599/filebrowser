@@ -22,6 +22,7 @@
         zIndex: 5 + prompts.indexOf(prompt),
       }"
       :aria-label="`${prompt.name}-prompt`"
+      :data-prompt-id="prompt.id"
     >
       <header
         class="prompt-taskbar"
@@ -120,6 +121,7 @@ import ConfigViewer from "./ConfigViewer.vue";
 import UserDefaults from "./UserDefaults.vue";
 import { state, getters, mutations } from "@/store";
 import { getObjectProperty, omitObjectProperty, setObjectProperty } from "@/utils/object.js";
+import { isPromptBlocked, raisePrompt } from '@/utils/promptStack';
 
 export default {
   name: "Prompts",
@@ -270,11 +272,7 @@ export default {
       return this.draggingIds.has(id);
     },
     isBlocked(prompt) {
-      // If there is a pinned prompt and this prompt isn't it, it's blocked
-      if (this.pinnedPromptExists && !prompt.pinned) return true;
-      // If this prompt has any open child, also it's blocked (parent)
-      if (this.prompts.some(p => p.parentId === prompt.id)) return true;
-      return false;
+      return isPromptBlocked(this.prompts, prompt);
     },
     isEditorPrompt(prompt) {
       return prompt?.name === "analytics-diagnostic" || prompt?.name === "config-viewer" || prompt?.name === "user-defaults";
@@ -305,16 +303,8 @@ export default {
     },
     makeTopPrompt(id) {
       if (getters.isMobile()) return; // Don't allow in mobile since we can lose the prompt easily.
-      const prompt = this.prompts.find(p => p.id === id);
-      if (!prompt) return;
-      if (this.pinnedPromptExists && !prompt.pinned) return;
-      const index = state.prompts.findIndex(p => p.id === id);
-      if (index === -1) return;
-      const pinnedCount = state.prompts.filter(p => p.pinned).length;
-      const targetIndex = state.prompts.length - pinnedCount;
-      if (index >= targetIndex) return;
-      const [movedPrompt] = state.prompts.splice(index, 1);
-      state.prompts.splice(targetIndex, 0, movedPrompt);
+      const reordered = raisePrompt(state.prompts, id);
+      if (reordered !== state.prompts) state.prompts = reordered;
     },
     getDisplayTitle(promptName) {
       // convert to lowercase
@@ -409,6 +399,7 @@ export default {
       // Find the prompt we're trying to close
       const promptToClose = state.prompts.find(p => p.id === id);
       if (!promptToClose) return;
+      if (this.isBlocked(promptToClose)) return;
       // Check if it's the upload prompt with active uploads
       if (promptToClose.name === "upload") {
         const hasActiveUploads = state.upload.isUploading;
@@ -434,7 +425,7 @@ export default {
         }
       }
       // Normal close behavior
-      mutations.closeTopPrompt(id);
+      mutations.dismissPrompt(id);
       // Clean up state for this prompt
       this.cleanupDragState(id);
     },
@@ -475,6 +466,7 @@ export default {
       if (event.defaultPrevented) {
         return;
       }
+      if (event.target instanceof Element && event.target.closest('input, textarea, select, [contenteditable="true"]')) return;
 
       const primary = this.findPrimaryActionButton(top.id);
       if (!primary) {
@@ -535,12 +527,12 @@ export default {
       const windows = this.$refs.promptWindow;
       const prompt = this.prompts.find(p => p.id === id);
       if (!prompt) return null;
-      const label = `${prompt.name}-prompt`;
       return Array.isArray(windows)
-        ? windows.find(w => w?.getAttribute('aria-label') === label)
+        ? windows.find(w => w?.getAttribute('data-prompt-id') === String(id))
         : windows;
     },
     onPointerDown(e, id, type) {
+      if (this.isBlocked(this.prompts.find(prompt => prompt.id === id))) return;
       this.makeTopPrompt(id);
       if (type === "mouse" && e.button !== 0) return;
       if (type === "touch") {
@@ -598,8 +590,7 @@ export default {
       });
 
       // Find the element for this prompt
-      const windows = this.$refs.promptWindow;
-      const el = Array.isArray(windows) ? windows.find(w => w?.getAttribute('aria-label') === `${this.prompts.find(p => p.id === id)?.name}-prompt`) : windows;
+      const el = this.getPromptElement(id);
       if (el) this.clampDragOffset(id, el);
     },
     onPointerEnd(_e, id, type, moveHandler, endHandler) {
@@ -616,14 +607,12 @@ export default {
       this.draggingIds.delete(id);
     },
     startResize(e, id, edge) {
+      if (this.isBlocked(this.prompts.find(prompt => prompt.id === id))) return;
       const type = e.type === 'touchstart' ? 'touch' : 'mouse';
       const pos = this.getPointerPos(e, type);
       if (!pos) return;
       // Find the window
-      const windows = this.$refs.promptWindow;
-      const el = Array.isArray(windows)
-        ? windows.find(w => w?.getAttribute('aria-label') === `${this.prompts.find(p => p.id === id)?.name}-prompt`)
-        : windows;
+      const el = this.getPromptElement(id);
       if (!el) return;
       // Capture current size (if not already fixed, set it)
       let sizes = this.sizes;
@@ -732,10 +721,7 @@ export default {
         y: start.offsetY + deltaOffsetY,
       });
       // Clamp to viewport
-      const windows = this.$refs.promptWindow;
-      const el = Array.isArray(windows)
-        ? windows.find(w => w?.getAttribute('aria-label') === `${this.prompts.find(p => p.id === id)?.name}-prompt`)
-        : windows;
+      const el = this.getPromptElement(id);
       if (el) this.clampDragOffset(id, el);
     },
     onResizeEnd(_e, type, moveHandler, endHandler) {

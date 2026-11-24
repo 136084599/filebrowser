@@ -6,6 +6,7 @@ import { getters, mutations, state } from "@/store";
 import { validateLogin } from "@/utils/auth";
 import { sanitizePostLoginRedirect } from "@/utils/safeRedirect.js";
 import { globalVars } from "@/utils/constants";
+import { captureDirectoryPosition, directoryContext } from "@/utils/directoryNavigation";
 import Errors from "@/views/Errors.vue";
 import Files from "@/views/Files.vue";
 import Layout from "@/views/Layout.vue";
@@ -182,6 +183,12 @@ router.beforeResolve(async (to, from, next) => {
 
   const title = titles[to.name as keyof typeof titles] || String(to.name || '');
   document.title = `${globalVars.name} - ${title}`;
+  if (to.path !== from.path && ['Files', 'Share', 'PublicShare'].includes(String(from.name)) && !getters.isLoading()) {
+    captureDirectoryPosition(
+      directoryContext(state.req, state.user, getters.isShare() ? state.shareInfo.hash : ''),
+      document.getElementById('main'),
+    );
+  }
   mutations.setRoute(to);
 
   if (

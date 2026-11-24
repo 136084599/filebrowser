@@ -34,6 +34,7 @@ type Scanner struct {
 
 	// Active scan session
 	scanStartTime int64
+	failed        bool // An incomplete scan must never remove previously indexed entries.
 
 	// Per-scanner state (not shared with other scanners)
 	processedInodes map[uint64]struct{}  // Track inodes to detect hardlinks
@@ -87,7 +88,10 @@ func (s *Scanner) executeScan() {
 	// Cadence per scanner path: full when counter==0, then four quick scans, then wrap (5 runs per cycle).
 	var pre int
 	var quick bool
+	var previousDirs, previousFiles uint64
+	var previousScan time.Time
 	s.withStatsLock(func() {
+		previousDirs, previousFiles, previousScan = s.numDirs, s.numFiles, s.lastScanned
 		pre = s.fullScanCounter
 		quick = pre > 0 && pre < 5
 		s.fullScanCounter++
@@ -96,6 +100,14 @@ func (s *Scanner) executeScan() {
 		}
 	})
 	s.runIndexing(quick)
+	if s.failed {
+		s.withStatsLock(func() {
+			s.fullScanCounter = pre
+			s.numDirs, s.numFiles, s.lastScanned = previousDirs, previousFiles, previousScan
+		})
+		s.idx.registerScannerNextRun(s, time.Now().Add(5*time.Minute))
+		return
+	}
 	s.updateSchedule()
 }
 
@@ -125,7 +137,9 @@ func (s *Scanner) runRootScan(quick bool) {
 	}
 
 	s.statsMu.Lock()
-	s.lastScanned = time.Now()
+	if !s.failed {
+		s.lastScanned = time.Now()
+	}
 	s.statsMu.Unlock()
 	s.checkForNewChildDirectories()
 	if err := s.idx.db.ShrinkMemory(); err != nil {
@@ -163,6 +177,7 @@ func (s *Scanner) runFullScanRoot() {
 	_, _, err := s.idx.indexDirectory("/", config, s)
 	if err != nil {
 		logger.Errorf("Root scanner error: %v", err)
+		s.failed = true
 	}
 
 	s.flushBatch()
@@ -188,7 +203,7 @@ func (s *Scanner) runQuickScanRoot() {
 
 	// Get root-level folders from folderSizes map
 	s.idx.folderSizesMu.RLock()
-	var foldersToCheck []string
+	foldersToCheck := []string{"/"}
 	for path := range s.idx.folderSizes {
 		// Root scanner: only check direct children (one slash after root, like "/subdir/")
 		if strings.Count(path, "/") == 2 && path != "/" {
@@ -209,6 +224,7 @@ func (s *Scanner) runQuickScanRoot() {
 	for _, folderPath := range foldersToCheck {
 		changed, err := s.checkFolderModtime(folderPath)
 		if err != nil {
+			s.failed = true
 			errorCount++
 		} else if changed {
 			changedCount++
@@ -241,7 +257,9 @@ func (s *Scanner) runChildScan(quick bool) {
 	}
 
 	s.withStatsLock(func() {
-		s.lastScanned = time.Now()
+		if !s.failed {
+			s.lastScanned = time.Now()
+		}
 	})
 }
 
@@ -274,6 +292,7 @@ func (s *Scanner) runFullScanChild() {
 
 	_, _, err := s.idx.indexDirectory(s.scanPath, config, s)
 	if err != nil {
+		s.failed = true
 		if isPathGone(err) {
 			s.handlePathGone("full scan")
 			return
@@ -338,6 +357,7 @@ func (s *Scanner) runQuickScanChild() {
 	for _, folderPath := range foldersToCheck {
 		changed, err := s.checkFolderModtime(folderPath)
 		if err != nil {
+			s.failed = true
 			errorCount++
 		} else if changed {
 			changedCount++
@@ -360,7 +380,11 @@ func (s *Scanner) checkForNewChildDirectories() {
 	}
 
 	// Get current top-level directories from filesystem (already filtered by exclusion rules)
-	currentDirs := s.getTopLevelDirs()
+	currentDirs, listErr := s.readTopLevelDirs()
+	if listErr != nil {
+		s.failed = true
+		return
+	}
 	currentDirsMap := make(map[string]bool)
 	for _, dir := range currentDirs {
 		currentDirsMap[dir] = true
@@ -401,18 +425,23 @@ func (s *Scanner) checkForNewChildDirectories() {
 
 // getTopLevelDirs returns a list of top-level directory paths in the root
 func (s *Scanner) getTopLevelDirs() []string {
+	dirs, _ := s.readTopLevelDirs()
+	return dirs
+}
+
+func (s *Scanner) readTopLevelDirs() ([]string, error) {
 	dirs := []string{}
 	dir, err := os.Open(s.idx.Path)
 	if err != nil {
 		logger.Errorf("Failed to open root directory: %v", err)
-		return dirs
+		return nil, err
 	}
 	defer dir.Close()
 
 	files, err := dir.Readdir(-1)
 	if err != nil {
 		logger.Errorf("Failed to read root directory: %v", err)
-		return dirs
+		return nil, err
 	}
 
 	for _, file := range files {
@@ -439,7 +468,7 @@ func (s *Scanner) getTopLevelDirs() []string {
 		dirs = append(dirs, indexPath)
 	}
 
-	return dirs
+	return dirs, nil
 }
 
 // updateSchedule adjusts the scanner's schedule based on whether files changed (adaptive mode only).
@@ -508,6 +537,7 @@ func (idx *Index) ensureScanUpdatedPaths() {
 // prepareScanState initializes per-scan maps. Quick scans previously skipped this and could
 // panic with "assignment to entry in nil map" when writing scanUpdatedPaths or hardlink tracking.
 func (s *Scanner) prepareScanState() {
+	s.failed = false
 	s.idx.ensureScanUpdatedPaths()
 	if s.processedInodes == nil {
 		s.processedInodes = make(map[uint64]struct{})
@@ -531,17 +561,23 @@ func (s *Scanner) handlePathGone(context string) {
 	if s.scanPath == "/" {
 		return
 	}
+	if _, err := os.Stat(s.idx.Path); err != nil {
+		return
+	}
 	logger.Infof("Scanner [%s] stopping (%s): directory no longer exists", s.scanPath, context)
 	s.removeSelf()
 }
 
 // directoryExists checks if the scanner's directory still exists
 func (s *Scanner) directoryExists() bool {
+	if _, err := os.Stat(s.idx.Path); err != nil {
+		return true
+	}
 	realPath := strings.TrimRight(s.idx.Path, "/") + s.scanPath
 	realPath = strings.TrimSuffix(realPath, "/")
 
 	_, err := os.Stat(realPath)
-	return err == nil
+	return !os.IsNotExist(err)
 }
 
 // removeSelf removes this scanner from the index's scanner map
@@ -620,6 +656,7 @@ func (s *Scanner) checkFolderModtime(folderPath string) (bool, error) {
 		opts := Options{
 			Recursive:     false, // Don't recurse - we're checking each folder individually
 			IsRoutineScan: true,
+			ShowHidden:    true,
 		}
 
 		dirInfo, err := s.idx.GetDirInfo(dir, info, folderPath, opts, s)
@@ -627,6 +664,25 @@ func (s *Scanner) checkFolderModtime(folderPath string) (bool, error) {
 			logger.Errorf("[QUICK_SCAN] Error getting dir info for %s: %v", folderPath, err)
 			return true, err
 		}
+		// A shallow scan discovers new subdirectories too. Index those now;
+		// otherwise they never enter the quick-scan folder map until a full scan.
+		for i := range dirInfo.Folders {
+			child := &dirInfo.Folders[i]
+			childPath := utils.AddTrailingSlashIfNotExists(folderPath + child.Name)
+			if _, exists := s.idx.GetFolderSize(childPath); !exists {
+				size, hasPreview, err := s.idx.indexDirectory(childPath, Options{Recursive: true, IsRoutineScan: true}, s)
+				if err != nil {
+					s.failed = true
+					continue
+				}
+				if !s.idx.Config.UseLogicalSize && size < 4096 {
+					size = 4096
+				}
+				dirInfo.Size += size - child.Size
+				child.Size, child.HasPreview = size, hasPreview
+			}
+		}
+		s.idx.SetFolderSize(folderPath, uint64(dirInfo.Size))
 
 		// Update metadata (will be batched)
 		s.idx.UpdateMetadata(dirInfo, s, true)
@@ -677,7 +733,7 @@ func (s *Scanner) checkFolderModtime(folderPath string) (bool, error) {
 }
 
 func (s *Scanner) purgeStaleEntries(isRoot bool, isQuickScan bool) {
-	if s.scanStartTime == 0 {
+	if s.scanStartTime == 0 || s.failed {
 		return
 	}
 
@@ -701,7 +757,7 @@ func (s *Scanner) purgeStaleEntries(isRoot bool, isQuickScan bool) {
 			// Only include paths within this scanner's scope
 			if s.scanPath == "/" {
 				// Root scanner: only direct children (no nested paths)
-				if strings.Count(path, "/") == 2 && strings.HasPrefix(path, "/") {
+				if path == "/" || (strings.Count(path, "/") == 2 && strings.HasPrefix(path, "/")) {
 					updatedDirs = append(updatedDirs, path)
 				}
 			} else {

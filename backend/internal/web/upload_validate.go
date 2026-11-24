@@ -114,7 +114,6 @@ type chunkUploadResponse struct {
 }
 
 func writeChunkUploadResponse(w http.ResponseWriter, offset, total int64, complete bool) error {
-	w.Header().Set("Connection", "close")
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
 	return json.NewEncoder(w).Encode(chunkUploadResponse{
 		Offset:   offset,

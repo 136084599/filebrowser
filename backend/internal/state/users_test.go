@@ -5,8 +5,8 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/users"
+	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 )
 
 func TestCreateUserValidateUsername(t *testing.T) {
@@ -259,7 +259,7 @@ func TestUpdateUserClearsTOTPWhenOtpDisabled(t *testing.T) {
 
 	u := &users.User{
 		FrontendUser: users.FrontendUser{
-			Username: "alice",
+			Username:   "alice",
 			OtpEnabled: true,
 		},
 	}
@@ -310,11 +310,11 @@ func TestUpdateUserPatchPreservesBackendSourcePermissions(t *testing.T) {
 	scopePerms := users.SourceFilePermissions{View: true, Download: true, Modify: true}
 	u := &users.User{
 		FrontendUser: users.FrontendUser{
-			Username: "alice",
+			Username:    "alice",
 			Permissions: users.Permissions{Admin: true},
 		},
 		BackendScopes: []users.BackendScope{{Path: "/data/a", Scope: "/", Permissions: scopePerms}},
-		Version:     users.SourcePermissionsMigrationVersion,
+		Version:       users.SourcePermissionsMigrationVersion,
 	}
 	if err = CreateUser(u, "password"); err != nil {
 		t.Fatal(err)
@@ -341,3 +341,27 @@ func TestUpdateUserPatchPreservesBackendSourcePermissions(t *testing.T) {
 	}
 }
 
+func TestCreateUserPreservesExplicitScopePermissions(t *testing.T) {
+	initSidebarLinkTestDB(t)
+	explicit := users.SourceFilePermissions{View: true, Download: true, Create: true, Modify: true, Delete: false, Configured: true}
+	u := &users.User{FrontendUser: users.FrontendUser{Username: "explicit-uploader", FrontendScopes: []users.FrontendScope{{Name: "include", Scope: "/uploads", Permissions: &explicit}}}}
+	if err := CreateUser(u, "password"); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := GetUserByUsername(u.Username)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, scope := range loaded.BackendScopes {
+		if scope.Scope == "/uploads" {
+			found = true
+			if scope.Permissions != explicit {
+				t.Fatalf("explicit permissions replaced: %#v", scope.Permissions)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("explicit scope lost")
+	}
+}

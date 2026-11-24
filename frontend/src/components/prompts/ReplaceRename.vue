@@ -16,6 +16,7 @@
       </p>
     </template>
     <p v-else>{{ $t("prompts.replaceMessage") }}</p>
+    <p v-if="busy" role="status">{{ $t('prompts.operationInProgress') }}</p>
   </div>
   <div class="card-actions">
     <button
@@ -23,7 +24,8 @@
       type="button"
       class="button button--flat button--blue"
       :id="canReplace ? undefined : 'focus-prompt'"
-      @click="(event) => currentPrompt.confirm(event, 'rename')"
+      @click="choose($event, 'rename')"
+      :disabled="busy"
       :aria-label="$t('general.rename')"
       :title="$t('general.rename')"
     >
@@ -33,7 +35,8 @@
       v-if="allowSkip"
       type="button"
       class="button button--flat button--blue"
-      @click="(event) => currentPrompt.confirm(event, 'skip')"
+      @click="choose($event, 'skip')"
+      :disabled="busy"
       :aria-label="$t('prompts.uploadMissing')"
       :title="$t('prompts.uploadMissing')"
     >
@@ -44,8 +47,8 @@
       type="button"
       id="focus-prompt"
       class="button button--flat button--red"
-      :disabled="isSameFile"
-      @click="(event) => currentPrompt.confirm(event, 'overwrite')"
+      :disabled="isSameFile || busy"
+      @click="choose($event, 'overwrite')"
       :aria-label="$t('general.replace')"
       :title="$t('general.replace')">
       {{ $t("general.replace") }}
@@ -55,21 +58,24 @@
 
 <script>
 import { getters, state } from "@/store";
+import { notify } from '@/notify';
 
 export default {
   name: "replace-rename",
+  props: { promptId: { type: Number, default: null } },
+  data: () => ({ busy: false }),
   computed: {
     currentPrompt() {
-      return getters.currentPrompt();
+      return this.promptId === null ? getters.currentPrompt() : state.prompts.find(prompt => prompt.id === this.promptId);
     },
     allowRename() {
-      return this.currentPrompt.props?.allowRename !== false;
+      return this.currentPrompt?.props?.allowRename !== false;
     },
     allowSkip() {
-      return this.currentPrompt.props?.allowSkip === true;
+      return this.currentPrompt?.props?.allowSkip === true;
     },
     isSameFile() {
-      return this.currentPrompt.props?.isSameFile === true;
+      return this.currentPrompt?.props?.isSameFile === true;
     },
     canReplace() {
       const canModify = !!getters.sourcePermissions().modify;
@@ -79,6 +85,15 @@ export default {
       return canModify;
     },
   },
-  methods: {},
+  methods: {
+    async choose(event, option) {
+      event.preventDefault();
+      if (this.busy || typeof this.currentPrompt?.confirm !== 'function') return;
+      this.busy = true;
+      try { await this.currentPrompt.confirm(event, option); }
+      catch (error) { notify.showError(error.message || String(error)); }
+      finally { this.busy = false; }
+    },
+  },
 };
 </script>

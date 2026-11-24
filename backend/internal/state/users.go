@@ -5,12 +5,12 @@ import (
 	"reflect"
 	"strings"
 
-	"github.com/gtsteffaniak/filebrowser/backend/internal/errors"
-	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
-	"github.com/gtsteffaniak/filebrowser/backend/internal/utils"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/share"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/database/users"
+	"github.com/gtsteffaniak/filebrowser/backend/internal/errors"
 	"github.com/gtsteffaniak/filebrowser/backend/internal/usersidebar"
+	"github.com/gtsteffaniak/filebrowser/backend/internal/utils"
+	"github.com/gtsteffaniak/filebrowser/backend/pkg/settings"
 )
 
 // User operations
@@ -202,6 +202,17 @@ func CreateUser(user *users.User, plaintextPassword string) error {
 	// Incoming API "scopes" → BackendScopes; FrontendScopes must not remain on the persisted user.
 	if err := applyScopesFromAPI(user); err != nil {
 		return err
+	}
+	// Keep explicitly supplied scope permissions when profile defaults are
+	// applied below. Without the map, ApplyUserDefaults treats them as unseeded.
+	for _, scope := range user.BackendScopes {
+		if scope.Permissions.IsUnset() {
+			continue
+		}
+		if user.BackendSourcePermissions == nil {
+			user.BackendSourcePermissions = make(map[string]users.SourceFilePermissions)
+		}
+		user.BackendSourcePermissions[scope.Path] = scope.Permissions
 	}
 
 	// If still no BackendScopes (omitted or invalid API names), same defaults as ApplyUserDefaults.

@@ -1035,5 +1035,19 @@
     "days": "Jours{suffix}",
     "months": "Mois{suffix}",
     "timeUnit": "Unité de temps"
+  },
+  "transfer": {
+    "batchDownload": "Download selected items separately (keep folders)",
+    "helperInstructions": "Download the task file, then drag it onto the Windows downloader and choose a destination. Downloads run in parallel, preserve folders and can resume after interruption.",
+    "getHelper": "Download Windows downloader",
+    "verifying": "Verifying file integrity…",
+    "browserDownload": "Browser downloads (no archive)",
+    "browserInstructions": "Each file becomes a browser download. Files go to your download folder without the original folder structure; the browser controls concurrency. If prompted, allow multiple downloads for this site.",
+    "browserRequested": "Requested {count} browser downloads. Check progress and failures in the browser download list.",
+    "browserRetry": "If a task was blocked or failed, click its file link to download it again.",
+    "downloadMethod": "Choose how to download the selected items.",
+    "uploadRetrying": "Retry {count}/{max} in {seconds}s: {reason}",
+    "uploadRetriesExhausted": "Automatic retries ({count}) failed. Click retry to continue. Reason: {reason}",
+    "uploadIdle": "No upload activity within the connection timeout."
   }
 }
