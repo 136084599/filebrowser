@@ -10,7 +10,7 @@
 
 ## Windows x64 下载与首次启动
 
-[直接下载 Windows x64 整包](https://github.com/136084599/filebrowser-transfer-fixes/raw/main/downloads/FileBrowser-LC-Fix-10-Windows-x64.zip)，或打开 [下载目录与整包校验值](https://github.com/136084599/filebrowser-transfer-fixes/tree/main/downloads)。整包包含服务 EXE、示例配置、文件校验值和这份说明。解压后在该目录把 `config.example.yaml` 复制为 `config.yaml`。首次启动后在浏览器使用。在该目录打开 PowerShell，运行下面的命令。
+[直接下载 Windows x64 整包](https://github.com/136084599/filebrowser-transfer-fixes/releases/download/v2.0.1-lcfix10/FileBrowser-LC-Fix-10-Windows-x64.zip)，或打开 [Release 附件与 SHA-256](https://github.com/136084599/filebrowser-transfer-fixes/releases/tag/v2.0.1-lcfix10)。整包包含下游服务 EXE、示例配置、文件校验值和操作说明，无需另装上游 File Browser。解压后在该目录把 `config.example.yaml` 复制为 `config.yaml`。首次启动后在浏览器使用。在该目录打开 PowerShell，运行下面的命令。
 
 ```powershell
 New-Item -ItemType Directory -Force -Path .\files | Out-Null
