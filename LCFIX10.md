@@ -64,4 +64,10 @@ LC Fix 10 同时改动了传输、预览、索引、原生下载器及迁移。�
 
 上游已修复上传写盘阶段的误暂停、暂停时的页面离开保护和部分目录索引更新。移动覆盖时的目录合并已有单独上游 PR。 [上传暂停 #3346](https://github.com/gtsteffaniak/filebrowser/pull/3346) · [导航保护 #3220](https://github.com/gtsteffaniak/filebrowser/pull/3220) · [索引 #3260](https://github.com/gtsteffaniak/filebrowser/pull/3260) · [目录合并 #3440](https://github.com/gtsteffaniak/filebrowser/pull/3440)
 
-后续可按上游当前上传协议，分别验证取消时清理未完成文件和上传结束的整文件校验。Windows 下载器和返回目录时的位置恢复涉及新功能，可以独立说明使用场景。提交目标、格式与测试要求见 [上游贡献指南](https://github.com/gtsteffaniak/filebrowser/blob/main/CONTRIBUTING.md)。
+### 返回列表时的高亮
+
+LC Fix 10 返回列表时会给刚离开的文件或目录加临时描边，保留文件操作原有的选中状态。上游普通列表已有返回定位，关闭预览后会选中最后查看的文件，返回上级时也会选中刚离开的子目录。 [上游预览导航 #3156](https://github.com/gtsteffaniak/filebrowser/pull/3156)
+
+在上游 `dev/v2.2.0` 上，公开分享从子目录返回上级时漏掉了该定位。已用包含中文、空格、方括号、井号和百分号的目录名复现，并验证同一分享会定位、切换到另一分享时不会沿用刚离开的目录。两个回归用例、全套 745 项前端测试和类型检查均通过。 [分享返回定位补丁](https://github.com/136084599/filebrowser/tree/upstream-share-return-highlight)
+
+后续可按上游当前上传协议，分别验证取消时清理未完成文件和上传结束的整文件校验。Windows 下载器可以独立说明使用场景。 [上游贡献指南](https://github.com/gtsteffaniak/filebrowser/blob/main/CONTRIBUTING.md)。
