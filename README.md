@@ -1,8 +1,8 @@
 # File Browser Quantum · LC Fix 10
 
-面向 Windows x64 的 File Browser Quantum 传输修复版。若你只是想试用，下载整包即可，解压后用浏览器访问本机服务。
+面向 Windows x64 的 File Browser Quantum 传输修复版。Windows x64 用户可直接下载 Release 整包。包里的 EXE 就是修好的 File Browser 服务，解压并配置后即可在本机运行，无需先安装上游。
 
-**[Windows x64 Release 和 EXE](https://github.com/136084599/filebrowser-transfer-fixes/releases/tag/v2.0.1-lcfix10)** · [安装、迁移、回滚与编译](LCFIX10.md) · [下载校验](https://github.com/136084599/filebrowser-transfer-fixes/tree/main/downloads)
+**[Windows x64 Release 和 EXE](https://github.com/136084599/filebrowser-transfer-fixes/releases/tag/v2.0.1-lcfix10)** · [安装、迁移、回滚与编译](LCFIX10.md) · [下载校验](https://github.com/136084599/filebrowser-transfer-fixes/releases/download/v2.0.1-lcfix10/SHA256SUMS.txt)
 
 ## 修复内容
 
