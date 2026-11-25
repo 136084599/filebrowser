@@ -50,3 +50,9 @@ go build -trimpath -buildvcs=false -ldflags '-s -w' -o ..\filebrowser-transfer-f
 ```
 
 当前下载包由此分支的程序源文件构建。验证覆盖了 Windows x64 下的启动、首页与管理员登录。你的实际网关、磁盘、共享目录、用户权限和大文件链路仍需在自己的部署环境验收。包内不含生产配置、旧数据库或现场测试日志。
+
+## 给上游贡献时怎么拆
+
+LC Fix 10 集合了传输、下载器、预览、索引和迁移等不同改动。上游已经合入上传写盘阶段的暂停判断和部分索引大小修复。先对照上游的 [上传修复 #3346](https://github.com/gtsteffaniak/filebrowser/pull/3346)、[索引修复 #3260](https://github.com/gtsteffaniak/filebrowser/pull/3260) 与当前开发分支。
+
+优先验证一个能独立说明的行为，例如同一文件有多个预览请求时，共用一次生成任务，并在一个查看者离开后继续服务其余查看者。用当前开发分支确认行为、补对应回归测试，再按[上游贡献指南](https://github.com/gtsteffaniak/filebrowser/blob/main/CONTRIBUTING.md)向匹配的 `dev/vX.X.X` 提交。Windows 下载器涉及新交付物和接口，适合先单独讨论。
