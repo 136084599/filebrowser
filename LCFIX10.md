@@ -53,6 +53,15 @@ go build -trimpath -buildvcs=false -ldflags '-s -w' -o ..\filebrowser-transfer-f
 
 ## 给上游贡献时怎么拆
 
-LC Fix 10 集合了传输、下载器、预览、索引和迁移等不同改动。上游已经合入上传写盘阶段的暂停判断和部分索引大小修复。先对照上游的 [上传修复 #3346](https://github.com/gtsteffaniak/filebrowser/pull/3346)、[索引修复 #3260](https://github.com/gtsteffaniak/filebrowser/pull/3260) 与当前开发分支。
+LC Fix 10 同时改动了传输、预览、索引、原生下载器及迁移。在上游 `dev/v2.2.0` 上独立复现、拆分并测试的四个问题，已分别提交为草稿 PR。
 
-优先验证一个能独立说明的行为，例如同一文件有多个预览请求时，共用一次生成任务，并在一个查看者离开后继续服务其余查看者。用当前开发分支确认行为、补对应回归测试，再按[上游贡献指南](https://github.com/gtsteffaniak/filebrowser/blob/main/CONTRIBUTING.md)向匹配的 `dev/vX.X.X` 提交。Windows 下载器涉及新交付物和接口，适合先单独讨论。
+| 修复 | 上游 PR |
+| --- | --- |
+| 同一视频缩略图的并发请求复用一次生成，单个请求取消时保留其他请求 | [#3457](https://github.com/gtsteffaniak/filebrowser/pull/3457) |
+| 目录大小批量写入使用正确的 SQLite 参数顺序 | [#3458](https://github.com/gtsteffaniak/filebrowser/pull/3458) |
+| 冲突确认等待处理结果时防止重复提交 | [#3459](https://github.com/gtsteffaniak/filebrowser/pull/3459) |
+| 目录变空后立即使用缓存中的零值，同时保留缓存未命中时的数据库回退 | [#3460](https://github.com/gtsteffaniak/filebrowser/pull/3460) |
+
+上游已修复上传写盘阶段的误暂停、暂停时的页面离开保护和部分目录索引更新。移动覆盖时的目录合并已有单独上游 PR。 [上传暂停 #3346](https://github.com/gtsteffaniak/filebrowser/pull/3346) · [导航保护 #3220](https://github.com/gtsteffaniak/filebrowser/pull/3220) · [索引 #3260](https://github.com/gtsteffaniak/filebrowser/pull/3260) · [目录合并 #3440](https://github.com/gtsteffaniak/filebrowser/pull/3440)
+
+后续可按上游当前上传协议，分别验证取消时清理未完成文件和上传结束的整文件校验。Windows 下载器和返回目录时的位置恢复涉及新功能，可以独立说明使用场景。提交目标、格式与测试要求见 [上游贡献指南](https://github.com/gtsteffaniak/filebrowser/blob/main/CONTRIBUTING.md)。
