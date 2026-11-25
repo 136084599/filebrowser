@@ -55,6 +55,15 @@ function sameListing(a, b) {
   return b.every((item) => known.get(item.name) === describeItem(item));
 }
 
+function getReturnedChildPath(previousPath, destinationPath) {
+  const parent = (destinationPath || "").split("/").filter(Boolean);
+  const previous = (previousPath || "").split("/").filter(Boolean);
+  if (previous.length <= parent.length || !parent.every((segment, index) => segment === previous[index])) {
+    return null;
+  }
+  return `/${previous.slice(0, parent.length + 1).join("/")}`;
+}
+
 function reusableParentItems(inScope, filePath) {
   const req = state.req;
   if (!req || !inScope(req)) {
@@ -489,11 +498,17 @@ export default {
           }
 
           this.loadingProgress = 10;
+          const previous = state.req;
           const file = await fetchShareItemWithParent(this.sharePassword, signal, !wasReload);
           if (isStale()) return;
           mutations.replaceRequest(file);
           if (file.type !== "directory") {
             state.pendingHighlight = { path: file.path, source: file.source };
+          } else if (!wasReload && previous?.type === "directory" && previous.hash === hash) {
+            const path = getReturnedChildPath(previous.path, file.path);
+            if (path) {
+              state.pendingHighlight = { path, source: file.source };
+            }
           }
           document.title = `${globalVars.name} - ${this.$t("general.share")} - ${file.name}`;
           await this.patchMediaMetadataIfNeeded(file);
@@ -557,10 +572,9 @@ export default {
           // highlight the directory we just left
           const prevReq = state.req;
           if (!wasReload && prevReq?.type === "directory" && prevReq.source === fetchSource) {
-            const up = fetchPath.split("/").filter(Boolean);
-            const down = (prevReq.path || "").split("/").filter(Boolean);
-            if (down.length > up.length && up.every((seg, i) => seg === down[i])) {
-              state.pendingHighlight = { path: `/${down.slice(0, up.length + 1).join("/")}`, source: fetchSource };
+            const path = getReturnedChildPath(prevReq.path, fetchPath);
+            if (path) {
+              state.pendingHighlight = { path, source: fetchSource };
             }
           }
           // Show the last listing of the folder and refresh it in the background
